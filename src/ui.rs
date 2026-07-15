@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use chrono::{Datelike, Duration, Local, NaiveDate};
+use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, Utc};
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Layout, Rect},
@@ -11,18 +11,24 @@ use ratatui::{
 use crate::{
     app::{App, DeleteChoice, DeleteConfirmation, DeleteTarget, Mode, NewTagField, TagPickerRow},
     config::ThemeConfig,
+    history::{TaskHistoryEvent, TaskHistoryKind},
     model::{TAG_COLOR_PALETTE, TagDefinition, Task},
 };
 
 const MIN_COLUMN_WIDTH: u16 = 26;
+const TASK_CURSOR_WIDTH: u16 = 2;
+const TASK_CARD_GAP: u16 = 1;
+const TASK_CARD_RIGHT_PADDING: u16 = 1;
 
 pub struct Theme {
+    background: Color,
     accent: Color,
     selected_background: Color,
     border: Color,
     text: Color,
     muted: Color,
     danger: Color,
+    success: Color,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -34,17 +40,23 @@ pub enum HitTarget {
 impl Theme {
     pub fn from_config(config: &ThemeConfig) -> Result<Self> {
         Ok(Self {
+            background: parse_color(&config.background)?,
             accent: parse_color(&config.accent)?,
             selected_background: parse_color(&config.selected_background)?,
             border: parse_color(&config.border)?,
             text: parse_color(&config.text)?,
             muted: parse_color(&config.muted)?,
             danger: parse_color(&config.danger)?,
+            success: parse_color(&config.success)?,
         })
     }
 }
 
 pub fn draw(frame: &mut Frame, app: &App, theme: &Theme) {
+    frame.render_widget(
+        Block::default().style(Style::default().bg(theme.background)),
+        frame.area(),
+    );
     let [board_area, footer_area] =
         Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(frame.area());
     draw_board(frame, board_area, app, theme);
@@ -100,7 +112,6 @@ fn draw_board(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         let header_style = if header_selected {
             Style::default()
                 .fg(theme.accent)
-                .bg(theme.selected_background)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(theme.text).add_modifier(Modifier::BOLD)
@@ -122,11 +133,25 @@ fn draw_board(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             .border_style(Style::default().fg(border_color));
         let header_inner = header_block.inner(header);
         frame.render_widget(header_block, header);
+        let cursor_width = TASK_CURSOR_WIDTH.min(header_inner.width);
+        let right_padding = cursor_width.min(header_inner.width.saturating_sub(cursor_width));
+        let [cursor_area, title_area, _] = Layout::horizontal([
+            Constraint::Length(cursor_width),
+            Constraint::Min(0),
+            Constraint::Length(right_padding),
+        ])
+        .areas(header_inner);
+        if header_selected {
+            frame.render_widget(
+                Paragraph::new("▊").style(Style::default().fg(theme.accent)),
+                cursor_area,
+            );
+        }
         frame.render_widget(
             Paragraph::new(title)
                 .alignment(Alignment::Center)
                 .style(header_style),
-            header_inner,
+            title_area,
         );
         let body_block = Block::default()
             .borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM)
@@ -135,6 +160,16 @@ fn draw_board(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         frame.render_widget(body_block, body);
         if header.height >= 3 && header.width >= 2 && body.height > 0 {
             let junction_style = Style::default().fg(border_color);
+            let separator_width = header.width.saturating_sub(2);
+            frame.render_widget(
+                Paragraph::new("─".repeat(usize::from(separator_width))).style(junction_style),
+                Rect::new(
+                    header.x.saturating_add(1),
+                    header.bottom() - 1,
+                    separator_width,
+                    1,
+                ),
+            );
             frame.render_widget(
                 Paragraph::new("├").style(junction_style),
                 Rect::new(header.x, header.bottom() - 1, 1, 1),
@@ -163,24 +198,44 @@ fn draw_cards(frame: &mut Frame, area: Rect, app: &App, column_index: usize, the
     for (task_index, rect) in visible_cards(area, app, column_index) {
         let task = &tasks[task_index];
         let selected = selected == Some(task_index);
-        let border = if selected { theme.accent } else { theme.border };
-        let content_color = if selected { theme.accent } else { theme.text };
-        let metadata_color = if selected { theme.accent } else { theme.muted };
-        let mut lines = vec![Line::styled(
-            task.title.clone(),
-            Style::default()
-                .fg(content_color)
-                .add_modifier(Modifier::BOLD),
-        )];
-        if !task_metadata(task).is_empty() {
-            lines.push(task_metadata_line(app, task, metadata_color, theme));
+        let moving = selected && matches!(app.mode, Mode::Moving(_));
+        if moving {
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme.accent));
+            let inner = block.inner(rect);
+            let content_area = Rect::new(
+                inner.x,
+                inner.y,
+                inner.width.saturating_sub(TASK_CARD_RIGHT_PADDING),
+                inner.height,
+            );
+            frame.render_widget(block, rect);
+            frame.render_widget(
+                Paragraph::new(task_card_lines(app, task, content_area.width.max(1), theme)),
+                content_area,
+            );
+            continue;
         }
-        let card_block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(border));
-        let card_inner = card_block.inner(rect);
-        frame.render_widget(card_block, rect);
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), card_inner);
+
+        let cursor_width = TASK_CURSOR_WIDTH.min(rect.width);
+        let right_padding = TASK_CARD_RIGHT_PADDING.min(rect.width.saturating_sub(cursor_width));
+        let [cursor_area, content_area, _] = Layout::horizontal([
+            Constraint::Length(cursor_width),
+            Constraint::Min(0),
+            Constraint::Length(right_padding),
+        ])
+        .areas(rect);
+        if selected {
+            let cursor = (0..cursor_area.height)
+                .map(|_| Line::styled("▊", Style::default().fg(theme.accent)))
+                .collect::<Vec<_>>();
+            frame.render_widget(Paragraph::new(cursor), cursor_area);
+        }
+        frame.render_widget(
+            Paragraph::new(task_card_lines(app, task, content_area.width.max(1), theme)),
+            content_area,
+        );
     }
 }
 
@@ -213,6 +268,21 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         }
         Mode::Help { .. } => "HELP mode · esc/q returns to where you were · Ctrl-C quits",
     };
+    let floating = !matches!(app.mode, Mode::Board | Mode::Moving(_));
+    if floating {
+        let hidden = if let Some(status) = &app.status {
+            format!(" {status} · {help}")
+        } else {
+            help.to_owned()
+        };
+        frame.render_widget(
+            Paragraph::new(hidden)
+                .style(Style::default().fg(theme.background).bg(theme.background)),
+            area,
+        );
+        return;
+    }
+
     let mut spans = Vec::new();
     if let Some(status) = &app.status {
         let color = if status.starts_with("error:") {
@@ -227,11 +297,15 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         spans.push(Span::raw("· "));
     }
     spans.push(Span::styled(help, Style::default().fg(theme.muted)));
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(theme.background)),
+        area,
+    );
 }
 
 fn draw_task_details(frame: &mut Frame, app: &App, cursor: usize, theme: &Theme) {
-    let area = centered(frame.area(), 72, 20);
+    let preferred_height = frame.area().height.saturating_sub(4).clamp(20, 34);
+    let area = centered(frame.area(), 92, preferred_height);
     let task = app.current_task();
     let content_width = usize::from(area.width.saturating_sub(2)).max(1);
     let tags_index = 2 + task.checklist.len();
@@ -271,7 +345,11 @@ fn draw_task_details(frame: &mut Frame, app: &App, cursor: usize, theme: &Theme)
             .unwrap_or_else(|| "—".into()),
     ));
 
-    let available = usize::from(area.height.saturating_sub(6)).max(1);
+    // Two border rows and one modal-hint row are reserved by `render_modal`.
+    let content_capacity = usize::from(area.height.saturating_sub(3)).max(1);
+    let available = (content_capacity / 2)
+        .max(5)
+        .min(content_capacity.saturating_sub(3).max(1));
     let field_lines = fields
         .into_iter()
         .enumerate()
@@ -300,16 +378,203 @@ fn draw_task_details(frame: &mut Frame, app: &App, cursor: usize, theme: &Theme)
             break;
         }
     }
-    lines.push(Line::raw(""));
-    lines.push(Line::styled(
-        format!(
-            "  Created: {} · task id {}",
-            task.created_at.format("%Y-%m-%d %H:%M UTC"),
-            task.id
+    if lines.len() < content_capacity {
+        lines.push(Line::raw(""));
+    }
+    if lines.len() < content_capacity {
+        lines.push(Line::styled(
+            "  History",
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    let groups = task_history_line_groups(app, task, content_width, theme);
+    let mut hidden_events = app.task_history_earlier.get(&task.id).copied().unwrap_or(0);
+    for (index, group) in groups.iter().enumerate() {
+        let available = content_capacity.saturating_sub(lines.len());
+        if available == 0 {
+            hidden_events += groups.len() - index;
+            break;
+        }
+        if group.len() <= available {
+            lines.extend(group.iter().cloned());
+        } else {
+            hidden_events += groups.len() - index;
+            break;
+        }
+    }
+    if hidden_events > 0 && lines.len() < content_capacity {
+        let message = format!(
+            "  … {hidden_events} earlier event{}",
+            if hidden_events == 1 { "" } else { "s" }
+        );
+        lines.push(Line::styled(message, Style::default().fg(theme.muted)));
+    }
+    render_modal(
+        frame,
+        area,
+        " Task details ",
+        lines,
+        "hjkl select · Enter/e edit · a add · d delete · Esc/q close · ? help",
+        theme,
+    );
+}
+
+fn task_history_line_groups(
+    app: &App,
+    task: &Task,
+    width: usize,
+    theme: &Theme,
+) -> Vec<Vec<Line<'static>>> {
+    let fallback = [TaskHistoryEvent {
+        at: task.created_at,
+        kind: TaskHistoryKind::Created,
+    }];
+    let events = app
+        .task_history
+        .get(&task.id)
+        .map(Vec::as_slice)
+        .unwrap_or(&fallback);
+    let now = Utc::now();
+    let timestamp_width = events
+        .iter()
+        .map(|event| Span::raw(relative_time(event.at, now)).width())
+        .max()
+        .unwrap_or(0);
+    let prefix_width = 2 + timestamp_width + 2;
+    let event_width = width.saturating_sub(prefix_width).max(1);
+
+    events
+        .iter()
+        .rev()
+        .map(|event| {
+            let content = history_event_content_lines(app, event, event_width, theme);
+            let timestamp = relative_time(event.at, now);
+            content
+                .into_iter()
+                .enumerate()
+                .map(|(index, line)| {
+                    let mut spans = vec![Span::styled(
+                        if index == 0 {
+                            format!("  {timestamp:<timestamp_width$}  ")
+                        } else {
+                            " ".repeat(prefix_width)
+                        },
+                        Style::default().fg(theme.muted),
+                    )];
+                    spans.extend(line.spans);
+                    Line::from(spans)
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn history_event_content_lines(
+    app: &App,
+    event: &TaskHistoryEvent,
+    width: usize,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let muted = Style::default().fg(theme.muted);
+    match &event.kind {
+        TaskHistoryKind::Created => history_text_lines("Created task", width, muted),
+        TaskHistoryKind::Moved {
+            from_column,
+            to_column,
+            ..
+        } if from_column == to_column => {
+            history_text_lines(&format!("Reordered within {from_column}"), width, muted)
+        }
+        TaskHistoryKind::Moved {
+            from_column,
+            to_column,
+            ..
+        } => history_text_lines(
+            &format!("Moved from {from_column} to {to_column}"),
+            width,
+            muted,
         ),
-        Style::default().fg(theme.muted),
-    ));
-    render_modal(frame, area, " Task details ", lines, theme);
+        TaskHistoryKind::Changed { field, from, to } => {
+            let mut lines = history_text_lines(&format!("Changed {field} from:"), width, muted);
+            lines.extend(history_value_lines(
+                from,
+                width,
+                Style::default().fg(theme.danger),
+            ));
+            lines.extend(history_text_lines("to:", width, muted));
+            lines.extend(history_value_lines(
+                to,
+                width,
+                Style::default().fg(theme.success),
+            ));
+            lines
+        }
+        TaskHistoryKind::Added { field, value } => {
+            history_text_lines(&format!("Added {field}: {value}"), width, muted)
+        }
+        TaskHistoryKind::Removed { field, value } => {
+            history_text_lines(&format!("Removed {field}: {value}"), width, muted)
+        }
+        TaskHistoryKind::TagAdded(tag) => history_tag_event_line(app, "Added tag:", tag, theme),
+        TaskHistoryKind::TagRemoved(tag) => history_tag_event_line(app, "Removed tag:", tag, theme),
+    }
+}
+
+fn history_text_lines(value: &str, width: usize, style: Style) -> Vec<Line<'static>> {
+    wrap_hanging(value, width, width)
+        .into_iter()
+        .map(|line| Line::styled(line, style))
+        .collect()
+}
+
+fn history_value_lines(value: &str, width: usize, style: Style) -> Vec<Line<'static>> {
+    let indent = "  ";
+    let value = if value.is_empty() { "—" } else { value };
+    wrap_hanging(
+        value,
+        width.saturating_sub(indent.len()).max(1),
+        width.saturating_sub(indent.len()).max(1),
+    )
+    .into_iter()
+    .map(|value| {
+        Line::from(vec![
+            Span::styled(indent, style),
+            Span::styled(value, style),
+        ])
+    })
+    .collect()
+}
+
+fn history_tag_event_line(app: &App, label: &str, tag: &str, theme: &Theme) -> Vec<Line<'static>> {
+    let style = app
+        .board
+        .tag_by_name(tag)
+        .map(tag_style)
+        .unwrap_or_else(|| Style::default().fg(theme.text).bg(theme.border));
+    vec![Line::from(vec![
+        Span::styled(format!("{label} "), Style::default().fg(theme.muted)),
+        Span::styled(format!(" {tag} "), style),
+    ])]
+}
+
+fn relative_time(at: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    let elapsed = now.signed_duration_since(at).max(Duration::zero());
+    if elapsed < Duration::minutes(1) {
+        return "just now".into();
+    }
+    let (count, unit) = if elapsed < Duration::hours(1) {
+        (elapsed.num_minutes(), "minute")
+    } else if elapsed < Duration::days(1) {
+        (elapsed.num_hours(), "hour")
+    } else if elapsed < Duration::days(30) {
+        (elapsed.num_days(), "day")
+    } else if elapsed < Duration::days(365) {
+        (elapsed.num_days() / 30, "month")
+    } else {
+        (elapsed.num_days() / 365, "year")
+    };
+    format!("{count} {unit}{} ago", if count == 1 { "" } else { "s" })
 }
 
 fn task_detail_text_lines(
@@ -519,7 +784,14 @@ fn draw_column_details(frame: &mut Frame, app: &App, cursor: usize, theme: &Them
             ),
         ])
         .collect();
-    render_modal(frame, area, " Column details ", lines, theme);
+    render_modal(
+        frame,
+        area,
+        " Column details ",
+        lines,
+        "arrows/hjkl select · Enter/e/r rename · Esc/q close · ? help",
+        theme,
+    );
 }
 
 fn draw_delete_confirmation(
@@ -563,7 +835,8 @@ fn draw_delete_confirmation(
                 .fg(theme.danger)
                 .add_modifier(Modifier::BOLD),
         )
-        .border_style(Style::default().fg(theme.danger));
+        .border_style(Style::default().fg(theme.danger))
+        .style(Style::default().bg(theme.background));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let [message_area, buttons_area, hint_area] = Layout::vertical([
@@ -587,7 +860,7 @@ fn draw_delete_confirmation(
     }
     frame.render_widget(
         Paragraph::new(message)
-            .style(Style::default().bg(Color::Reset))
+            .style(Style::default().bg(theme.background))
             .wrap(Wrap { trim: false }),
         message_area,
     );
@@ -626,7 +899,7 @@ fn draw_delete_confirmation(
     frame.render_widget(
         Paragraph::new("←/→ or h/l select · Enter activate · y delete · n/Esc/q cancel")
             .alignment(Alignment::Center)
-            .style(Style::default().fg(theme.muted)),
+            .style(Style::default().fg(theme.muted).bg(theme.background)),
         hint_area,
     );
 }
@@ -678,14 +951,10 @@ fn draw_input(frame: &mut Frame, input: &crate::app::InputState, app: &App, them
         .min(frame_area.width)
         .max(1);
     let inner_width = width.saturating_sub(2).max(1);
-    let mut lines = vec![
-        Line::styled(
-            format!("> {}▏", input.text),
-            Style::default().fg(theme.text),
-        ),
-        Line::raw(""),
-        Line::styled(input.kind.hint(), Style::default().fg(theme.muted)),
-    ];
+    let mut lines = vec![Line::styled(
+        format!("> {}▏", input.text),
+        Style::default().fg(theme.text),
+    )];
     if let Some(status) = &app.status {
         lines.push(Line::styled(
             status.clone(),
@@ -697,7 +966,7 @@ fn draw_input(frame: &mut Frame, input: &crate::app::InputState, app: &App, them
         .wrap(Wrap { trim: false });
     let content_height = usize_to_u16(paragraph.line_count(inner_width));
     let height = content_height
-        .saturating_add(2)
+        .saturating_add(3)
         .max(6)
         .min(frame_area.height.saturating_sub(2).max(1));
     let area = centered_fixed(frame_area, width, height);
@@ -710,16 +979,28 @@ fn draw_input(frame: &mut Frame, input: &crate::app::InputState, app: &App, them
                 .fg(theme.accent)
                 .add_modifier(Modifier::BOLD),
         )
-        .border_style(Style::default().fg(theme.accent));
+        .border_style(Style::default().fg(theme.accent))
+        .style(Style::default().bg(theme.background));
     let inner = block.inner(area);
-    let scroll = content_height.saturating_sub(inner.height);
+    let [content_area, hint_area] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
+    let scroll = content_height.saturating_sub(content_area.height);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
-    frame.render_widget(paragraph.scroll((scroll, 0)), inner);
+    frame.render_widget(paragraph.scroll((scroll, 0)), content_area);
+    frame.render_widget(
+        Paragraph::new(format!(
+            "type to edit · {} · Ctrl-U clear · q cancel · ? help",
+            input.kind.hint()
+        ))
+        .alignment(Alignment::Center)
+        .style(Style::default().fg(theme.muted).bg(theme.background)),
+        hint_area,
+    );
 }
 
 fn draw_date_picker(frame: &mut Frame, picker: &crate::app::DatePickerState, theme: &Theme) {
-    let area = centered_fixed(frame.area(), 56, 15);
+    let area = centered_fixed(frame.area(), 84, 14);
     let first = NaiveDate::from_ymd_opt(picker.selected.year(), picker.selected.month(), 1)
         .expect("selected date always has a valid first day");
     let grid_start = first
@@ -765,33 +1046,35 @@ fn draw_date_picker(frame: &mut Frame, picker: &crate::app::DatePickerState, the
         }
         lines.push(Line::from(days));
     }
-    lines.extend([
-        Line::raw(""),
-        Line::styled(
-            "←→/hl day · ↑↓/jk week · PgUp/PgDn month · t today",
-            Style::default().fg(theme.muted),
-        ),
-        Line::styled(
-            "Enter confirm · d/Delete clear · Esc cancel · ? help",
-            Style::default().fg(theme.muted),
-        ),
-    ]);
-
     frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Due date picker ")
+        .title_alignment(Alignment::Center)
+        .title_style(
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        )
+        .border_style(Style::default().fg(theme.accent))
+        .style(Style::default().bg(theme.background));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let [content_area, hint_area] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
     frame.render_widget(
-        Paragraph::new(lines).alignment(Alignment::Center).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Due date picker ")
-                .title_alignment(Alignment::Center)
-                .title_style(
-                    Style::default()
-                        .fg(theme.accent)
-                        .add_modifier(Modifier::BOLD),
-                )
-                .border_style(Style::default().fg(theme.accent)),
-        ),
-        area,
+        Paragraph::new(lines)
+            .alignment(Alignment::Center)
+            .style(Style::default().bg(theme.background)),
+        content_area,
+    );
+    frame.render_widget(
+        Paragraph::new(
+            "arrows/hjkl move · PgUp/PgDn month · t today · Enter set · d clear · Esc/q cancel · ? help",
+        )
+        .alignment(Alignment::Center)
+        .style(Style::default().fg(theme.muted).bg(theme.background)),
+        hint_area,
     );
 }
 
@@ -814,7 +1097,8 @@ fn draw_tag_picker(
                 .fg(theme.accent)
                 .add_modifier(Modifier::BOLD),
         )
-        .border_style(Style::default().fg(theme.accent));
+        .border_style(Style::default().fg(theme.accent))
+        .style(Style::default().bg(theme.background));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     render_tag_picker_row(
@@ -841,8 +1125,9 @@ fn draw_tag_picker(
     );
     frame.render_widget(
         Paragraph::new("arrows/hjkl select · Enter add/remove/create · Esc close · ? help")
-            .style(Style::default().fg(theme.muted)),
-        Rect::new(inner.x, inner.y.saturating_add(4), inner.width, 1),
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(theme.muted).bg(theme.background)),
+        Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1),
     );
 }
 
@@ -1033,10 +1318,6 @@ fn draw_new_tag(frame: &mut Frame, app: &App, state: &crate::app::NewTagState, t
             ),
         ]),
         Line::raw(""),
-        Line::styled(
-            "type name · Tab/↑↓ fields · h/l color · Enter continue/create · Esc cancel",
-            Style::default().fg(theme.muted),
-        ),
     ];
     if let Some(status) = &app.status {
         lines.push(Line::styled(
@@ -1044,7 +1325,14 @@ fn draw_new_tag(frame: &mut Frame, app: &App, state: &crate::app::NewTagState, t
             Style::default().fg(theme.danger),
         ));
     }
-    render_modal(frame, area, " New tag ", lines, theme);
+    render_modal(
+        frame,
+        area,
+        " New tag ",
+        lines,
+        "type name · Tab/↑↓ fields · h/l color · Enter continue/create · Esc/q cancel · ? help",
+        theme,
+    );
 }
 
 fn draw_help(frame: &mut Frame, theme: &Theme) {
@@ -1121,13 +1409,22 @@ fn draw_help(frame: &mut Frame, theme: &Theme) {
                 .fg(theme.accent)
                 .add_modifier(Modifier::BOLD),
         )
-        .border_style(Style::default().fg(theme.accent));
+        .border_style(Style::default().fg(theme.accent))
+        .style(Style::default().bg(theme.background));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let columns =
-        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(inner);
+    let [content_area, hint_area] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
+    let columns = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(content_area);
     frame.render_widget(Paragraph::new(left), columns[0]);
     frame.render_widget(Paragraph::new(right), columns[1]);
+    frame.render_widget(
+        Paragraph::new("Esc/q close · Ctrl-C quit")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(theme.muted).bg(theme.background)),
+        hint_area,
+    );
 }
 
 fn render_modal(
@@ -1135,65 +1432,145 @@ fn render_modal(
     area: Rect,
     title: &str,
     lines: Vec<Line<'static>>,
+    hint: &str,
     theme: &Theme,
 ) {
     frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .title_alignment(Alignment::Center)
+        .title_style(
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        )
+        .border_style(Style::default().fg(theme.accent))
+        .style(Style::default().bg(theme.background));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let [content_area, hint_area] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
     frame.render_widget(
         Paragraph::new(lines)
-            .style(Style::default().fg(theme.text).bg(Color::Reset))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(title)
-                    .title_alignment(Alignment::Center)
-                    .title_style(
-                        Style::default()
-                            .fg(theme.accent)
-                            .add_modifier(Modifier::BOLD),
-                    )
-                    .border_style(Style::default().fg(theme.accent)),
-            )
+            .style(Style::default().fg(theme.text).bg(theme.background))
             .wrap(Wrap { trim: false }),
-        area,
+        content_area,
+    );
+    frame.render_widget(
+        Paragraph::new(hint)
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(theme.muted).bg(theme.background)),
+        hint_area,
     );
 }
 
-fn task_metadata(task: &Task) -> String {
-    let mut metadata: Vec<String> = task.tags.iter().map(|tag| format!(" {tag} ")).collect();
-    if let Some(date) = task.due_date {
-        metadata.push(format!("due {}", date.format("%Y-%m-%d")));
-    }
-    metadata.join(" ")
-}
-
-fn task_metadata_line(
-    app: &App,
-    task: &Task,
-    metadata_color: Color,
-    theme: &Theme,
-) -> Line<'static> {
-    let mut spans = Vec::new();
-    for name in &task.tags {
-        if !spans.is_empty() {
-            spans.push(Span::raw(" "));
-        }
-        let style = app
-            .board
-            .tag_by_name(name)
-            .map(tag_style)
-            .unwrap_or_else(|| Style::default().fg(theme.text).bg(theme.border));
-        spans.push(Span::styled(format!(" {name} "), style));
-    }
-    if let Some(date) = task.due_date {
-        if !spans.is_empty() {
-            spans.push(Span::raw(" "));
-        }
-        spans.push(Span::styled(
-            format!("due {}", date.format("%Y-%m-%d")),
-            Style::default().fg(metadata_color),
+fn task_card_lines(app: &App, task: &Task, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+    let width = usize::from(width).max(1);
+    let mut lines = wrap_hanging(&task.title, width, width)
+        .into_iter()
+        .map(|line| {
+            Line::styled(
+                line,
+                Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+            )
+        })
+        .collect::<Vec<_>>();
+    if !task.tags.is_empty() {
+        lines.extend(task_card_tag_lines(
+            &task.tags,
+            width,
+            Style::default().fg(theme.muted),
+            |name| {
+                app.board
+                    .tag_by_name(name)
+                    .map(tag_style)
+                    .unwrap_or_else(|| Style::default().fg(theme.text).bg(theme.border))
+            },
         ));
     }
-    Line::from(spans)
+    if let Some(date) = task.due_date {
+        lines.extend(task_card_bullet_lines(
+            &format!("due {}", date.format("%Y-%m-%d")),
+            width,
+            Style::default().fg(theme.muted),
+        ));
+    }
+    lines
+}
+
+fn task_card_bullet_lines(value: &str, width: usize, style: Style) -> Vec<Line<'static>> {
+    let prefix = "  - ";
+    let indent = "    ";
+    wrap_hanging(
+        value,
+        width.saturating_sub(Span::raw(prefix).width()).max(1),
+        width.saturating_sub(Span::raw(indent).width()).max(1),
+    )
+    .into_iter()
+    .enumerate()
+    .map(|(index, value)| {
+        Line::from(vec![
+            Span::styled(if index == 0 { prefix } else { indent }, style),
+            Span::styled(value, style),
+        ])
+    })
+    .collect()
+}
+
+fn task_card_tag_lines<F>(
+    tags: &[String],
+    width: usize,
+    prefix_style: Style,
+    mut style_for: F,
+) -> Vec<Line<'static>>
+where
+    F: FnMut(&str) -> Style,
+{
+    let prefix = "  - ";
+    let indent = "    ";
+    let mut lines = Vec::new();
+    let mut spans = vec![Span::styled(prefix, prefix_style)];
+    let mut used = Span::raw(prefix).width();
+    let mut has_tag = false;
+
+    for name in tags {
+        let token = format!(" {name} ");
+        let token_width = Span::raw(&token).width();
+        if has_tag && used + 1 + token_width > width {
+            lines.push(Line::from(spans));
+            spans = vec![Span::styled(indent, prefix_style)];
+            used = Span::raw(indent).width();
+            has_tag = false;
+        }
+        if has_tag {
+            spans.push(Span::raw(" "));
+            used += 1;
+        }
+        if used >= width {
+            lines.push(Line::from(spans));
+            spans = vec![Span::styled(indent, prefix_style)];
+            used = Span::raw(indent).width();
+        }
+
+        let style = style_for(name);
+        let mut remaining = token.as_str();
+        while !remaining.is_empty() {
+            let available = width.saturating_sub(used).max(1);
+            let split = width_prefix_end(remaining, available);
+            spans.push(Span::styled(remaining[..split].to_owned(), style));
+            used += Span::raw(&remaining[..split]).width();
+            remaining = &remaining[split..];
+            if !remaining.is_empty() {
+                lines.push(Line::from(spans));
+                spans = vec![Span::styled(indent, prefix_style)];
+                used = Span::raw(indent).width();
+            }
+        }
+        has_tag = true;
+    }
+    lines.push(Line::from(spans));
+    lines
 }
 
 fn tag_style(tag: &TagDefinition) -> Style {
@@ -1272,7 +1649,8 @@ fn visible_cards(area: Rect, app: &App, column_index: usize) -> Vec<(usize, Rect
     let selected = (column_index == app.selected_column)
         .then_some(app.selected_task)
         .flatten();
-    let start = first_visible_task(tasks, selected, area.width, area.height);
+    let moving = matches!(app.mode, Mode::Moving(_));
+    let start = first_visible_task(tasks, selected, moving, area.width, area.height);
     let mut cards = Vec::new();
     let mut y = area.y;
     for (task_index, task) in tasks.iter().enumerate().skip(start) {
@@ -1280,13 +1658,16 @@ fn visible_cards(area: Rect, app: &App, column_index: usize) -> Vec<(usize, Rect
         if remaining == 0 {
             break;
         }
-        let required = task_card_height(task, area.width);
+        let required = task_card_height(task, area.width, moving && selected == Some(task_index));
         if required > remaining && !cards.is_empty() {
             break;
         }
         let height = required.min(remaining);
         cards.push((task_index, Rect::new(area.x, y, area.width, height)));
-        y = y.saturating_add(height);
+        y = y
+            .saturating_add(height)
+            .saturating_add(TASK_CARD_GAP)
+            .min(area.bottom());
     }
     cards
 }
@@ -1294,6 +1675,7 @@ fn visible_cards(area: Rect, app: &App, column_index: usize) -> Vec<(usize, Rect
 fn first_visible_task(
     tasks: &[Task],
     selected: Option<usize>,
+    moving: bool,
     width: u16,
     available_height: u16,
 ) -> usize {
@@ -1302,17 +1684,24 @@ fn first_visible_task(
     };
     let height_through_selected: u32 = tasks
         .iter()
+        .enumerate()
         .take(selected + 1)
-        .map(|task| u32::from(task_card_height(task, width)))
+        .map(|(index, task)| {
+            u32::from(task_card_footprint(
+                task,
+                width,
+                moving && index == selected,
+            ))
+        })
         .sum();
     if height_through_selected <= u32::from(available_height) {
         return 0;
     }
 
     let mut start = selected;
-    let mut used = u32::from(task_card_height(&tasks[selected], width));
+    let mut used = u32::from(task_card_footprint(&tasks[selected], width, moving));
     while start > 0 {
-        let previous = u32::from(task_card_height(&tasks[start - 1], width));
+        let previous = u32::from(task_card_footprint(&tasks[start - 1], width, false));
         if used + previous > u32::from(available_height) {
             break;
         }
@@ -1322,22 +1711,35 @@ fn first_visible_task(
     start
 }
 
-fn task_card_height(task: &Task, width: u16) -> u16 {
-    let inner_width = width.saturating_sub(2).max(1);
-    let title_lines = wrapped_line_count(&task.title, inner_width).max(1);
-    let metadata = task_metadata(task);
-    let metadata_lines = if metadata.is_empty() {
-        0
-    } else {
-        wrapped_line_count(&metadata, inner_width)
-    };
-    usize_to_u16(title_lines.saturating_add(metadata_lines).saturating_add(2))
+fn task_card_footprint(task: &Task, width: u16, moving: bool) -> u16 {
+    task_card_height(task, width, moving).saturating_add(TASK_CARD_GAP)
 }
 
-fn wrapped_line_count(value: &str, width: u16) -> usize {
-    Paragraph::new(value)
-        .wrap(Wrap { trim: true })
-        .line_count(width)
+fn task_card_height(task: &Task, width: u16, moving: bool) -> u16 {
+    let content_width = usize::from(
+        width
+            .saturating_sub(2)
+            .saturating_sub(TASK_CARD_RIGHT_PADDING)
+            .max(1),
+    );
+    let mut lines = wrap_hanging(&task.title, content_width, content_width)
+        .len()
+        .max(1);
+    if !task.tags.is_empty() {
+        lines += task_card_tag_lines(&task.tags, content_width, Style::default(), |_| {
+            Style::default()
+        })
+        .len();
+    }
+    if let Some(date) = task.due_date {
+        lines += task_card_bullet_lines(
+            &format!("due {}", date.format("%Y-%m-%d")),
+            content_width,
+            Style::default(),
+        )
+        .len();
+    }
+    usize_to_u16(lines.saturating_add(usize::from(moving) * 2))
 }
 
 fn usize_to_u16(value: usize) -> u16 {
@@ -1382,6 +1784,7 @@ fn parse_color(value: &str) -> Result<Color> {
         "red" => Color::Red,
         "green" => Color::Green,
         "yellow" => Color::Yellow,
+        "orange" => Color::Indexed(208),
         "blue" => Color::Blue,
         "magenta" => Color::Magenta,
         "cyan" => Color::Cyan,
@@ -1410,9 +1813,11 @@ fn parse_color(value: &str) -> Result<Color> {
 
 #[cfg(test)]
 mod tests {
+    use chrono::Utc;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::{Terminal, backend::TestBackend};
 
+    use crate::history::{TaskHistoryEvent, TaskHistoryKind};
     use crate::{app::App, config::ThemeConfig, model::Board};
 
     use super::*;
@@ -1420,6 +1825,7 @@ mod tests {
     #[test]
     fn parses_named_and_rgb_colors() {
         assert_eq!(parse_color("dark-gray").unwrap(), Color::DarkGray);
+        assert_eq!(parse_color("orange").unwrap(), Color::Indexed(208));
         assert_eq!(
             parse_color("#12abEF").unwrap(),
             Color::Rgb(0x12, 0xab, 0xef)
@@ -1468,9 +1874,10 @@ mod tests {
         let area = Rect::new(0, 0, 70, 20);
 
         assert_eq!(
-            hit_test(area, &app, 2, 4),
+            hit_test(area, &app, 2, 3),
             Some(HitTarget::Task { column: 0, task: 0 })
         );
+        assert_eq!(hit_test(area, &app, 2, 4), Some(HitTarget::Column(0)));
         assert_eq!(hit_test(area, &app, 2, 2), Some(HitTarget::Column(0)));
         assert_eq!(hit_test(area, &app, 36, 0), Some(HitTarget::Column(1)));
         assert_eq!(hit_test(area, &app, 36, 10), Some(HitTarget::Column(1)));
@@ -1491,18 +1898,31 @@ mod tests {
         assert_eq!(buffer[(39, 0)].symbol(), "┐");
         assert_eq!(buffer[(0, 2)].symbol(), "├");
         assert_eq!(buffer[(39, 2)].symbol(), "┤");
+        assert_eq!(buffer[(20, 2)].symbol(), "─");
+        assert_eq!(buffer[(20, 2)].fg, Color::Indexed(208));
         assert_eq!(buffer[(0, 3)].symbol(), "│");
         assert_eq!(buffer[(39, 3)].symbol(), "│");
-        assert_eq!(buffer[(0, 3)].fg, Color::Yellow);
-        assert_eq!(buffer[(39, 3)].fg, Color::Yellow);
-        assert_eq!(buffer[(0, 0)].bg, Color::Reset);
-        assert_eq!(buffer[(0, 2)].bg, Color::Reset);
-        assert_eq!(buffer[(1, 1)].bg, Color::DarkGray);
-        assert_eq!(buffer[(38, 1)].bg, Color::DarkGray);
+        assert_eq!(buffer[(0, 3)].fg, Color::Indexed(208));
+        assert_eq!(buffer[(39, 3)].fg, Color::Indexed(208));
+        assert_eq!(buffer[(0, 0)].bg, Color::Black);
+        assert_eq!(buffer[(0, 2)].bg, Color::Black);
+        assert_eq!(buffer[(1, 1)].symbol(), "▊");
+        assert_eq!(buffer[(1, 1)].fg, Color::Indexed(208));
+        assert_eq!(buffer[(1, 1)].bg, Color::Black);
+        assert_eq!(buffer[(2, 1)].bg, Color::Black);
+        assert_eq!(buffer[(3, 1)].bg, Color::Black);
+        assert_eq!(buffer[(36, 1)].bg, Color::Black);
+        assert_eq!(buffer[(37, 1)].bg, Color::Black);
+        assert_eq!(buffer[(38, 1)].bg, Color::Black);
+        assert_eq!(buffer[(19, 1)].symbol(), "T");
+        assert_eq!(buffer[(19, 1)].fg, Color::Indexed(208));
+        for x in 1..39 {
+            assert_eq!(buffer[(x, 1)].bg, Color::Black);
+        }
     }
 
     #[test]
-    fn selected_task_uses_accent_text_and_border_without_a_background() {
+    fn selected_task_uses_a_full_height_cursor_bar_without_restyling_content() {
         let mut board = Board::default();
         board.add_task(0, "Selected task".into());
         board.columns[0].tasks[0].due_date = NaiveDate::from_ymd_opt(2026, 7, 17);
@@ -1515,17 +1935,73 @@ mod tests {
         terminal.draw(|frame| draw(frame, &app, &theme)).unwrap();
 
         let buffer = terminal.backend().buffer();
-        assert_eq!(buffer[(1, 3)].symbol(), "┌");
-        assert_eq!(buffer[(38, 3)].symbol(), "┐");
-        assert_eq!(buffer[(1, 3)].fg, Color::Yellow);
-        assert_eq!(buffer[(2, 4)].fg, Color::Yellow);
-        assert_eq!(buffer[(2, 5)].fg, Color::Yellow);
+        assert_eq!(buffer[(1, 3)].symbol(), "▊");
+        assert_eq!(buffer[(1, 4)].symbol(), "▊");
+        assert_eq!(buffer[(1, 3)].fg, Color::Indexed(208));
+        assert_eq!(buffer[(1, 4)].fg, Color::Indexed(208));
+        assert_eq!(buffer[(3, 3)].symbol(), "S");
+        assert_eq!(buffer[(3, 3)].fg, Color::White);
+        assert_eq!(buffer[(5, 4)].symbol(), "-");
+        assert_eq!(buffer[(7, 4)].symbol(), "d");
+        assert_eq!(buffer[(7, 4)].fg, Color::DarkGray);
+        assert_ne!(buffer[(1, 3)].symbol(), "┌");
+        assert_ne!(buffer[(38, 3)].symbol(), "┐");
+        assert_eq!(buffer[(20, 2)].symbol(), "─");
+        assert_eq!(buffer[(20, 2)].fg, Color::Gray);
         assert_eq!(buffer[(0, 0)].fg, Color::Gray);
         assert_eq!(buffer[(39, 3)].fg, Color::Gray);
-        assert_eq!(buffer[(1, 3)].bg, Color::Reset);
-        assert_eq!(buffer[(38, 6)].bg, Color::Reset);
-        assert_eq!(buffer[(2, 4)].bg, Color::Reset);
-        assert_eq!(buffer[(37, 5)].bg, Color::Reset);
+        assert_eq!(buffer[(1, 3)].bg, Color::Black);
+        assert_eq!(buffer[(3, 3)].bg, Color::Black);
+        assert_eq!(buffer[(7, 4)].bg, Color::Black);
+    }
+
+    #[test]
+    fn moving_task_uses_an_accent_outline_instead_of_the_cursor_bar() {
+        let mut board = Board::default();
+        board.add_task(0, "Moving task".into());
+        board.columns[0].tasks[0].due_date = NaiveDate::from_ymd_opt(2026, 7, 17);
+        let mut app = App::new(board);
+        app.selected_task = Some(0);
+        app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        let theme = Theme::from_config(&ThemeConfig::default()).unwrap();
+        let backend = TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| draw(frame, &app, &theme)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(1, 3)].symbol(), "┌");
+        assert_eq!(buffer[(38, 3)].symbol(), "┐");
+        assert_eq!(buffer[(1, 6)].symbol(), "└");
+        assert_eq!(buffer[(38, 6)].symbol(), "┘");
+        assert_eq!(buffer[(1, 3)].fg, Color::Indexed(208));
+        assert_eq!(buffer[(38, 6)].fg, Color::Indexed(208));
+        assert_eq!(buffer[(2, 4)].symbol(), "M");
+        assert_eq!(buffer[(2, 4)].fg, Color::White);
+        assert_ne!(buffer[(2, 4)].symbol(), "▊");
+    }
+
+    #[test]
+    fn task_cards_reserve_one_cell_of_right_padding() {
+        let mut board = Board::default();
+        board.add_task(0, "x".repeat(36));
+        let mut app = App::new(board);
+        app.selected_task = Some(0);
+        let theme = Theme::from_config(&ThemeConfig::default()).unwrap();
+        let backend = TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| draw(frame, &app, &theme)).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(37, 3)].symbol(), "x");
+        assert_eq!(buffer[(38, 3)].symbol(), " ");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        terminal.draw(|frame| draw(frame, &app, &theme)).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(36, 4)].symbol(), "x");
+        assert_eq!(buffer[(37, 4)].symbol(), " ");
+        assert_eq!(buffer[(38, 4)].symbol(), "│");
     }
 
     #[test]
@@ -1543,7 +2019,7 @@ mod tests {
 
         terminal.draw(|frame| draw(frame, &app, &theme)).unwrap();
 
-        let area = centered(Rect::new(0, 0, 50, 20), 72, 20);
+        let area = centered(Rect::new(0, 0, 50, 20), 92, 20);
         let inner_x = area.x + 1;
         let screen = buffer_text(terminal.backend().buffer(), 50, 20);
         let rows = screen.lines().collect::<Vec<_>>();
@@ -1566,11 +2042,120 @@ mod tests {
         let buffer = terminal.backend().buffer();
         for y in description_y..=description_y + 1 {
             for x in inner_x..area.right() - 1 {
-                assert_eq!(buffer[(x, y)].bg, Color::Reset);
+                assert_eq!(buffer[(x, y)].bg, Color::Black);
             }
         }
-        assert_eq!(buffer[(inner_x, description_y)].fg, Color::Yellow);
-        assert_eq!(buffer[(inner_x + 4, description_y + 1)].fg, Color::Yellow);
+        assert_eq!(buffer[(inner_x, description_y)].fg, Color::Indexed(208));
+        assert_eq!(
+            buffer[(inner_x + 4, description_y + 1)].fg,
+            Color::Indexed(208)
+        );
+    }
+
+    #[test]
+    fn task_details_render_git_history_as_a_styled_aligned_timeline() {
+        let mut board = Board::default();
+        board.create_tag("urgent", "#E06C75").unwrap();
+        board.add_task(0, "New title".into());
+        board.columns[0].tasks[0].tags.push("urgent".into());
+        let mut app = App::new(board);
+        app.selected_task = Some(0);
+        app.mode = Mode::TaskDetails { cursor: 0 };
+        let now = Utc::now();
+        app.task_history.insert(
+            1,
+            vec![
+                TaskHistoryEvent {
+                    at: now - Duration::hours(2),
+                    kind: TaskHistoryKind::Created,
+                },
+                TaskHistoryEvent {
+                    at: now - Duration::minutes(8),
+                    kind: TaskHistoryKind::Changed {
+                        field: "title".into(),
+                        from: "Old title".into(),
+                        to: "New title".into(),
+                    },
+                },
+                TaskHistoryEvent {
+                    at: now - Duration::minutes(3),
+                    kind: TaskHistoryKind::TagAdded("urgent".into()),
+                },
+            ],
+        );
+        let theme = Theme::from_config(&ThemeConfig::default()).unwrap();
+        let backend = TestBackend::new(100, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| draw(frame, &app, &theme)).unwrap();
+
+        let screen = buffer_text(terminal.backend().buffer(), 100, 40);
+        assert!(screen.contains("History"));
+        assert!(screen.contains("Changed title from:"));
+        assert!(screen.contains("Old title"));
+        assert!(screen.contains("New title"));
+        assert!(screen.contains("Added tag:"));
+        assert!(screen.contains("minutes ago"));
+        assert!(screen.contains("arrows/hjkl select"));
+
+        let rows = screen.lines().collect::<Vec<_>>();
+        let (old_y, old_x) = rows
+            .iter()
+            .enumerate()
+            .find_map(|(y, row)| row.find("Old title").map(|x| (y, x)))
+            .unwrap();
+        let (new_y, new_x) = rows
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(y, row)| row.find("New title").map(|x| (y, x)))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(old_x as u16, old_y as u16)].fg, Color::Red);
+        assert_eq!(buffer[(new_x as u16, new_y as u16)].fg, Color::Green);
+        assert_eq!(buffer[(0, 39)].fg, Color::Black);
+        assert_eq!(buffer[(0, 39)].bg, Color::Black);
+    }
+
+    #[test]
+    fn relative_timestamps_use_human_units() {
+        let now = Utc::now();
+        assert_eq!(
+            relative_time(now - Duration::minutes(1), now),
+            "1 minute ago"
+        );
+        assert_eq!(relative_time(now - Duration::hours(3), now), "3 hours ago");
+        assert_eq!(relative_time(now - Duration::days(4), now), "4 days ago");
+    }
+
+    #[test]
+    fn single_value_history_is_inline_and_moves_show_only_column_names() {
+        let mut board = Board::default();
+        board.add_task(0, "Task".into());
+        let app = App::new(board);
+        let theme = Theme::from_config(&ThemeConfig::default()).unwrap();
+        let event = TaskHistoryEvent {
+            at: Utc::now(),
+            kind: TaskHistoryKind::Added {
+                field: "due date".into(),
+                value: "2026-08-05".into(),
+            },
+        };
+        let lines = history_event_content_lines(&app, &event, 60, &theme);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(line_text(&lines[0]), "Added due date: 2026-08-05");
+
+        let moved = TaskHistoryEvent {
+            at: Utc::now(),
+            kind: TaskHistoryKind::Moved {
+                from_column: "TODO".into(),
+                from_position: 3,
+                to_column: "DOING".into(),
+                to_position: 1,
+            },
+        };
+        let lines = history_event_content_lines(&app, &moved, 60, &theme);
+        assert_eq!(line_text(&lines[0]), "Moved from TODO to DOING");
     }
 
     #[test]
@@ -1676,9 +2261,15 @@ mod tests {
             .inner(body);
         let cards = visible_cards(inner, &app, 0);
         assert!(cards[0].1.height > 4);
+        let buffer = terminal.backend().buffer();
+        for y in cards[0].1.y..cards[0].1.bottom() {
+            assert_eq!(buffer[(cards[0].1.x, y)].symbol(), "▊");
+        }
         let screen = buffer_text(terminal.backend().buffer(), 32, 20);
         assert!(screen.contains("entirely"));
         assert!(screen.contains("visible"));
+        assert!(screen.contains("release"));
+        assert!(screen.contains("important"));
         assert!(screen.contains("2026-07-17"));
     }
 
@@ -1716,10 +2307,11 @@ mod tests {
         terminal.draw(|frame| draw(frame, &app, &theme)).unwrap();
 
         let buffer = terminal.backend().buffer();
-        assert_eq!(buffer[(2, 5)].bg, Color::Rgb(255, 255, 255));
-        assert_eq!(buffer[(2, 5)].fg, Color::Black);
-        assert_eq!(buffer[(11, 5)].bg, Color::Rgb(0, 0, 0));
-        assert_eq!(buffer[(11, 5)].fg, Color::White);
+        assert_eq!(buffer[(5, 4)].symbol(), "-");
+        assert_eq!(buffer[(8, 4)].bg, Color::Rgb(255, 255, 255));
+        assert_eq!(buffer[(8, 4)].fg, Color::Black);
+        assert_eq!(buffer[(16, 4)].bg, Color::Rgb(0, 0, 0));
+        assert_eq!(buffer[(16, 4)].fg, Color::White);
     }
 
     #[test]
@@ -1777,5 +2369,12 @@ mod tests {
             text.push('\n');
         }
         text
+    }
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
     }
 }

@@ -88,6 +88,8 @@ pub enum TaskCommand {
     },
     /// Show one task
     Show { task_id: u64 },
+    /// Show the semantic event history derived from Git commits
+    History { task_id: u64 },
     /// Add a task to a column
     Add {
         column_id: u64,
@@ -203,12 +205,14 @@ pub enum PushMode {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ThemeConfig {
+    pub background: String,
     pub accent: String,
     pub selected_background: String,
     pub border: String,
     pub text: String,
     pub muted: String,
     pub danger: String,
+    pub success: String,
 }
 
 impl Cli {
@@ -228,7 +232,7 @@ impl AppConfig {
             }
             let serialized = toml::to_string_pretty(&config).context("serialize default config")?;
             let contents = format!(
-                "# tdo configuration\n# Colors accept names such as yellow, cyan, dark_gray, or #RRGGBB.\n# push: never | every_change | interval\n\n{serialized}"
+                "# tdo configuration\n# Colors accept names such as orange, cyan, dark_gray, or #RRGGBB.\n# push: never | every_change | interval\n\n{serialized}"
             );
             fs::write(&path, contents)
                 .with_context(|| format!("write default config to {}", path.display()))?;
@@ -272,12 +276,14 @@ impl Default for PersistenceConfig {
 impl Default for ThemeConfig {
     fn default() -> Self {
         Self {
-            accent: "yellow".into(),
+            background: "black".into(),
+            accent: "orange".into(),
             selected_background: "dark_gray".into(),
             border: "gray".into(),
             text: "white".into(),
             muted: "dark_gray".into(),
             danger: "red".into(),
+            success: "green".into(),
         }
     }
 }

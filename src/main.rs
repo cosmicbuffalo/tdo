@@ -1,6 +1,7 @@
 mod app;
 mod commands;
 mod config;
+mod history;
 mod model;
 mod storage;
 mod ui;
@@ -22,6 +23,8 @@ use crossterm::{
 use ratatui::{Terminal, backend::CrosstermBackend};
 use storage::Store;
 use ui::Theme;
+
+const TUI_HISTORY_LIMIT: usize = 200;
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -66,6 +69,7 @@ fn run_event_loop(
     theme: &Theme,
 ) -> Result<()> {
     loop {
+        load_visible_task_history(app, store);
         terminal.draw(|frame| ui::draw(frame, app, theme))?;
 
         if event::poll(Duration::from_millis(250))? {
@@ -78,7 +82,16 @@ fn run_event_loop(
                         Action::None => {}
                         Action::Quit => return Ok(()),
                         Action::Save(message) => match store.save(&app.board, &message) {
-                            Ok(()) => app.report_saved(&message),
+                            Ok(()) => {
+                                refresh_selected_task_history(app, store);
+                                if !app
+                                    .status
+                                    .as_deref()
+                                    .is_some_and(|status| status.starts_with("error:"))
+                                {
+                                    app.report_saved(&message);
+                                }
+                            }
                             Err(error) => app.report_error(&error),
                         },
                     }
@@ -103,6 +116,54 @@ fn run_event_loop(
             app.report_error(&error);
         }
     }
+}
+
+fn load_visible_task_history(app: &mut App, store: &Store) {
+    if !matches!(app.mode, app::Mode::TaskDetails { .. }) {
+        return;
+    }
+    let Some(task_id) = selected_task_id(app) else {
+        return;
+    };
+    if !app.task_history.contains_key(&task_id) {
+        refresh_task_history(app, store, task_id);
+    }
+}
+
+fn refresh_selected_task_history(app: &mut App, store: &Store) {
+    if let Some(task_id) = selected_task_id(app) {
+        refresh_task_history(app, store, task_id);
+    }
+}
+
+fn refresh_task_history(app: &mut App, store: &Store, task_id: u64) {
+    match store.recent_task_history(task_id, TUI_HISTORY_LIMIT) {
+        Ok((history, earlier)) => {
+            app.task_history.clear();
+            app.task_history_earlier.clear();
+            app.task_history.insert(task_id, history);
+            if earlier > 0 {
+                app.task_history_earlier.insert(task_id, earlier);
+            }
+        }
+        Err(error) => {
+            // Mark this task loaded to avoid retrying on every 250 ms draw tick.
+            app.task_history.clear();
+            app.task_history_earlier.clear();
+            app.task_history.entry(task_id).or_default();
+            app.report_error(&error.context("load task history"));
+        }
+    }
+}
+
+fn selected_task_id(app: &App) -> Option<u64> {
+    app.selected_task.and_then(|task| {
+        app.board
+            .columns
+            .get(app.selected_column)
+            .and_then(|column| column.tasks.get(task))
+            .map(|task| task.id)
+    })
 }
 
 fn install_panic_restore() {

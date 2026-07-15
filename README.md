@@ -6,9 +6,9 @@ actions. Running `tdo` opens the TUI; the same board is also fully accessible
 through non-interactive commands designed to be easy for scripts and AI agents
 to use.
 
-Every confirmed mutation writes `board.json` and creates a commit in a dedicated
-Git repository. Interactive and CLI changes use the same model, validation, and
-history path.
+Every confirmed mutation updates a granular JSON state tree and creates a commit
+in a dedicated Git repository. Interactive and CLI changes use the same model,
+validation, event ledger, and history-indexing path.
 
 ## Highlights
 
@@ -18,6 +18,8 @@ history path.
   reversible MOVE mode, and a global `?` keymap.
 - Task titles, descriptions, checklist items, reusable colored tags, due dates,
   and immutable creation timestamps.
+- A per-task History timeline backed by an append-only Git event ledger and a
+  disposable, incrementally maintained SQLite query index.
 - A Git-backed JSON state store that commits each confirmed mutation and can
   optionally push every change or on an interval.
 - A complete non-interactive CLI with stable IDs and JSON output for scripts and
@@ -46,8 +48,8 @@ On first run, `tdo` creates:
   `$XDG_CONFIG_HOME`); and
 - a data repository at `~/.local/share/tdo` (or under `$XDG_DATA_HOME`).
 
-A new board starts with one empty `TODO` column. The first snapshot is committed
-immediately to the data repository.
+A new board starts with one empty `TODO` column. Its initial granular state is
+committed immediately to the data repository.
 
 Use `--config PATH`/`TDO_CONFIG` to select a config file and
 `--data-dir PATH`/`TDO_DATA_DIR` to override its data repository.
@@ -55,12 +57,18 @@ Use `--config PATH`/`TDO_CONFIG` to select a config file and
 ## TUI
 
 The cursor can land on a column header or an individual task card. A selected
-header accents the connected column outline; a selected card accents only that
-card's text and border. Normal navigation scrolls horizontally when columns are
-off-screen, and `1`–`9` jumps directly to a column.
+header uses the same `▊` cursor rail in its leftmost interior cell and accents
+the connected column outline; its centered label changes to the accent
+foreground without applying a background fill. Task cards are borderless in
+BOARD mode, and the selected card is indicated only by a cursor rail spanning
+all of its visible rows. Normal navigation scrolls horizontally when columns
+are off-screen, and `1`–`9` jumps directly to a column.
 
-All floating-window titles are centered. `q` closes the topmost floating window
-but quits from BOARD or MOVE mode; `Ctrl-C` always quits immediately.
+All floating-window titles are centered and every floating window has its own
+key-hint row along the bottom. While a window is open, the board hint row keeps
+its height but is painted in the board background color, so the active controls
+are unambiguous without causing a layout shift. `q` closes the topmost floating
+window but quits from BOARD or MOVE mode; `Ctrl-C` always quits immediately.
 
 ### Board view
 
@@ -91,8 +99,9 @@ retain at least one column.
 ### Move mode
 
 Move mode uses arrows or `hjkl` to reorder within a column or move across
-columns. `Enter` or `m` confirms the move as one commit; `Esc` restores the
-pre-move board without writing history.
+columns. The cursor rail is replaced by an accent outline around the moving
+card. `Enter` or `m` confirms the move as one commit; `Esc` restores the pre-move
+board without writing history.
 
 ### Column details
 
@@ -145,9 +154,23 @@ Input dialogs use `Enter` to confirm, `Esc` or `q` to cancel, and `Ctrl-U` to
 clear. The CLI continues to accept dates as `YYYY-MM-DD`; tags are managed
 through TAG PICKER mode in the TUI.
 
+Below the editable fields, the `History` section shows the task's Git-backed
+timeline with a compact, aligned relative-time column (`8 minutes ago`,
+`2 hours ago`, and so on). Field changes render the prior value in red and the
+new value in green. Tag additions/removals retain the tag's configured color;
+moves, creation, and other single-value events use muted gray. The newest events
+appear first. If a very long history does not fit in the current terminal, the
+panel reports how many earlier events are clipped.
+
+Single-value events stay inline (`Added due date: 2026-08-05`). Only true
+before/after changes use indented diff rows. Cross-column moves show column names
+without numeric positions (`Moved from TODO to DOING`); same-column movement is
+shown as `Reordered within TODO`.
+
 Input dialogs wrap and grow as text is entered. Task cards also grow vertically
-to show their complete wrapped title and every line required for colored tags
-and due-date metadata; card hit-testing uses the same dynamic geometry.
+to show their complete wrapped title. Colored tags and due dates appear below
+the title as hanging-indented bullet items, and every line required by that
+metadata remains visible; card hit-testing uses the same dynamic geometry.
 
 ## CLI and agent use
 
@@ -162,6 +185,8 @@ tdo --json column list
 tdo --json column show 1
 tdo --json task list --column 1
 tdo --json task show 7
+tdo task history 7
+tdo --json task history 7
 
 # Columns
 tdo column add DOING
@@ -217,12 +242,14 @@ push_interval_seconds = 300
 remote = "origin"
 
 [theme]
-accent = "yellow"
+background = "black"
+accent = "orange"
 selected_background = "dark_gray"
 border = "gray"
 text = "white"
 muted = "dark_gray"
 danger = "red"
+success = "green"
 ```
 
 Theme values accept standard terminal color names or quoted `#RRGGBB` values.
@@ -249,17 +276,60 @@ git -C ~/.local/share/tdo remote add origin git@github.com:OWNER/BOARD-DATA.git
 ```
 
 The persistence repository is intentionally separate from this source-code
-repository. Navigation, opening dialogs, and cancelled edits do not change
-`board.json` and therefore do not create commits.
+repository. Navigation, opening dialogs, and cancelled edits do not change the
+persisted state and therefore do not create commits.
 
 ## Storage format
 
-The configured repository contains a human-readable `board.json` and ordinary
-Git history. The file stores columns, ordered tasks, descriptions, checklist
-state, reusable tag definitions and colors, due dates, creation timestamps, and
-stable IDs. On load, externally edited JSON is validated and its ID counters are
-repaired before it is accepted. Boards from the earlier string-only tag format
-are migrated automatically.
+The configured repository uses persistence format v2:
+
+```text
+manifest.json                 schema, stable counters, column/tag ordering
+columns/<column-id>.json      column name and ordered task IDs
+tasks/<task-id>.json          one task and all of its editable metadata
+tags/<tag-id>.json            one reusable tag definition and color
+events/<segment>.jsonl        append-only semantic event batches
+```
+
+Normal saves calculate a small state delta and rewrite only affected task,
+column, or tag files plus the manifest. Editing one task does not serialize or
+stage every other task. Event batches are placed into ordered segments capped at
+1,000 batches, avoiding both one-file-per-commit checkout overhead and an
+unbounded monolithic log. Segments are atomically replaced and Git delta
+compression handles their append-heavy contents efficiently.
+
+Git remains the source of truth. A disposable SQLite projection lives at
+`.git/tdo/history-v1.sqlite3`; it is never committed or pushed. The first history
+query indexes the current event segments, records the represented Git `HEAD`,
+and subsequent queries reindex only event segments changed since that commit.
+The TUI requests a bounded newest page of history lazily when task details are
+opened, retains only the currently viewed task's page, and reports the count of
+older events. Board startup and UI memory therefore do not grow with every task
+timeline. `tdo task history` intentionally returns the full requested timeline
+for agent/export workflows. Deleting the SQLite file is safe—it rebuilds from
+the ledger without walking historical board snapshots.
+
+A compact save journal under `.git/tdo/` makes multi-file updates recoverable
+after interruption. It contains only the changed state records, event batch,
+and next manifest, then is removed after the Git commit succeeds.
+
+Repositories containing the former monolithic `board.json` migrate
+automatically on first v2 run. That one-time migration walks legacy commits,
+derives their semantic events, writes the granular current state and event
+ledger, removes `board.json`, and commits the migration. Normal v2 operation
+never repeats the legacy history scan. Older string-only tags are migrated as
+part of the same validation path.
+
+On load, externally edited state files are validated before being accepted and
+committed. For interactive latency, `push = "interval"` is preferable to
+synchronous `every_change` pushing when the remote is slow.
+
+For a repository with hundreds of thousands of commits, normal board startup is
+independent of commit count. A fresh history index performs one linear pass over
+the compact current event ledger—not one `git show` per commit—and later updates
+are bounded by changed segments. Git maintenance and clone/pull cost still scale
+with repository history in the usual way, but history queries do not use Git as
+a database.
 
 ## Development
 

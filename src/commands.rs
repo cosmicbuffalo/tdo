@@ -9,6 +9,7 @@ use crate::{
         AppConfig, ChecklistCommand, Cli, ColumnCommand, Command, ConfigCommand, TagCommand,
         TaskCommand,
     },
+    history::{TaskHistoryEvent, TaskHistoryKind},
     model::{
         Board, ChecklistItem, Column, TAG_COLOR_PALETTE, TagDefinition, Task, normalize_tag_color,
     },
@@ -144,6 +145,21 @@ fn run_task(command: &TaskCommand, board: &mut Board, store: &Store, json: bool)
             let (_, _, task) = find_task(board, *task_id)?;
             print_value(task, json)?;
         }
+        TaskCommand::History { task_id } => {
+            find_task(board, *task_id)?;
+            let events = store.task_history(*task_id)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&events)?);
+            } else {
+                for event in events.iter().rev() {
+                    println!(
+                        "{}\t{}",
+                        event.at.to_rfc3339(),
+                        describe_history_event(event)
+                    );
+                }
+            }
+        }
         TaskCommand::Add {
             column_id,
             title,
@@ -230,6 +246,29 @@ fn run_task(command: &TaskCommand, board: &mut Board, store: &Store, json: bool)
         }
     }
     Ok(())
+}
+
+fn describe_history_event(event: &TaskHistoryEvent) -> String {
+    match &event.kind {
+        TaskHistoryKind::Created => "Created task".into(),
+        TaskHistoryKind::Changed { field, from, to } => {
+            format!("Changed {field} from {from:?} to {to:?}")
+        }
+        TaskHistoryKind::Added { field, value } => format!("Added {field}: {value}"),
+        TaskHistoryKind::Removed { field, value } => format!("Removed {field}: {value}"),
+        TaskHistoryKind::TagAdded(tag) => format!("Added tag: {tag}"),
+        TaskHistoryKind::TagRemoved(tag) => format!("Removed tag: {tag}"),
+        TaskHistoryKind::Moved {
+            from_column,
+            to_column,
+            ..
+        } if from_column == to_column => format!("Reordered within {from_column}"),
+        TaskHistoryKind::Moved {
+            from_column,
+            to_column,
+            ..
+        } => format!("Moved from {from_column} to {to_column}"),
+    }
 }
 
 fn run_checklist(

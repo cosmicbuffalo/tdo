@@ -1,7 +1,11 @@
 use chrono::{Datelike, Duration, Local, NaiveDate};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    collections::HashMap,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
+use crate::history::TaskHistory;
 use crate::model::{Board, ChecklistItem, MAX_COLUMNS, TAG_COLOR_PALETTE};
 
 #[derive(Debug, Eq, PartialEq)]
@@ -111,6 +115,8 @@ pub struct MoveState {
 
 pub struct App {
     pub board: Board,
+    pub task_history: TaskHistory,
+    pub task_history_earlier: HashMap<u64, usize>,
     pub selected_column: usize,
     pub selected_task: Option<usize>,
     pub mode: Mode,
@@ -121,6 +127,8 @@ impl App {
     pub fn new(board: Board) -> Self {
         Self {
             board,
+            task_history: TaskHistory::new(),
+            task_history_earlier: HashMap::new(),
             selected_column: 0,
             selected_task: None,
             mode: Mode::Board,
@@ -535,8 +543,9 @@ impl App {
                 self.status = Some("move cancelled".into());
             }
             KeyCode::Enter | KeyCode::Char('m') => {
+                let task_id = self.current_task().id;
                 self.mode = Mode::Board;
-                return Action::Save("Move task".into());
+                return Action::Save(format!("Move task {task_id}"));
             }
             KeyCode::Up | KeyCode::Char('k') => self.move_task_vertically(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_task_vertically(1),
