@@ -181,7 +181,14 @@ pub enum TagCommand {
 #[serde(default)]
 pub struct AppConfig {
     pub persistence: PersistenceConfig,
+    pub input: InputConfig,
     pub theme: ThemeConfig,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct InputConfig {
+    pub mouse: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -273,6 +280,12 @@ impl Default for PersistenceConfig {
     }
 }
 
+impl Default for InputConfig {
+    fn default() -> Self {
+        Self { mouse: true }
+    }
+}
+
 impl Default for ThemeConfig {
     fn default() -> Self {
         Self {
@@ -313,5 +326,19 @@ fn expand_home(path: &std::path::Path) -> PathBuf {
     match path.strip_prefix("~/") {
         Ok(remainder) => home_dir().join(remainder),
         Err(_) => path.to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mouse_input_defaults_on_and_can_be_disabled() {
+        let defaulted: AppConfig = toml::from_str("").unwrap();
+        assert!(defaulted.input.mouse);
+
+        let disabled: AppConfig = toml::from_str("[input]\nmouse = false\n").unwrap();
+        assert!(!disabled.input.mouse);
     }
 }

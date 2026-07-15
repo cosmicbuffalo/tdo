@@ -15,15 +15,17 @@ validation, event ledger, and history-indexing path.
 - Vertical kanban swimlanes with up to nine columns, full card titles, colored
   tags, due dates, and mouse selection.
 - Modal keyboard navigation using arrow keys or `hjkl`, numbered column jumps,
-  reversible MOVE mode, and a global `?` keymap.
-- Task titles, descriptions, checklist items, reusable colored tags, due dates,
-  and immutable creation timestamps.
+  reversible MOVE mode, and a global `?` / `Ctrl-/` keymap.
+- Task titles, descriptions, timestamped checklist items, reusable colored
+  tags, due dates, and immutable creation timestamps.
 - A per-task History timeline backed by an append-only Git event ledger and a
   disposable, incrementally maintained SQLite query index.
 - A Git-backed JSON state store that commits each confirmed mutation and can
   optionally push every change or on an interval.
 - A complete non-interactive CLI with stable IDs and JSON output for scripts and
   AI agents.
+- Automatic cross-process refresh when another TUI or CLI changes the same data
+  repository, with stale-save protection for conflicting edits.
 
 ## Requirements
 
@@ -70,12 +72,18 @@ its height but is painted in the board background color, so the active controls
 are unambiguous without causing a layout shift. `q` closes the topmost floating
 window but quits from BOARD or MOVE mode; `Ctrl-C` always quits immediately.
 
+Mouse controls below are available when `input.mouse = true` (the default).
+When disabled, tdo does not request terminal mouse capture, ignores mouse
+events, and hides mouse-only controls and hints.
+
 ### Board view
 
 | Key | Action |
 | --- | --- |
-| `?` | Open the floating keymap from anywhere; `Esc` or `q` returns to the prior view |
+| `?` | Open the floating keymap outside text fields; `Esc` or `q` returns to the prior view |
+| `Ctrl-/` | Open the floating keymap anywhere; while editing text it shows only textarea controls |
 | Left click | Select a column header, task card, or a column's empty space |
+| Double-click a task | Select it and open Task Details |
 | Arrow keys or `hjkl` | Move between column headers and task cards |
 | `1`–`9` | Jump to a column |
 | `Enter` | Open details for the selected column or task |
@@ -111,6 +119,11 @@ to the board.
 
 ### Task details
 
+The editable metadata at the top is rendered as an aligned two-column table.
+Labels share the width of the longest label, a two-space gutter separates the
+columns, and wrapped values continue at the value column rather than under the
+label.
+
 | Key | Action |
 | --- | --- |
 | Arrow keys or `hjkl` | Select title, description, checklist items, tags, or due date |
@@ -118,7 +131,28 @@ to the board.
 | `e` | Edit the selected field/checklist item |
 | `a` | Add a checklist item |
 | `d` | Remove the selected checklist item |
+| `Ctrl-U` / `Ctrl-D` | Scroll up/down by half a page, as in Vim |
+| Mouse wheel | Scroll the complete details page |
+| `Page Up` / `Page Down` | Additional scrolling bindings, omitted from in-app hints |
+| Click a checklist item | Select it and toggle its checked state |
+| Click `[×]` | Close Task Details from the top-right border control |
 | `Esc` / `q` | Return to the board |
+
+Task Details grows with its contents until it reaches 80% of the terminal
+height. Beyond that point the unified metadata, Checklist, and History document
+scrolls without changing the modal size. Moving the keyboard selection keeps
+the selected field visible; `Ctrl-U`/`Ctrl-D`, the mouse wheel, or the retained
+page-key bindings can inspect any other part of the document. When content is
+hidden above or below the visible region, centered muted `↑ (more)` and
+`↓ (more)` indicators appear on the corresponding edge of the scroll region.
+They remain hidden when the complete document fits.
+
+Checklist items live in their own `Checklist` section below the metadata. Each
+item is indented and followed by a muted timing row such as
+`Added 2 hours ago`; completed items add `· Completed 1 hour ago` on that same
+row. New checklist actions persist those timestamps directly. Items created by
+older versions use their semantic history when available and otherwise fall
+back to the task creation time.
 
 Selecting a task's Tags field opens TAG PICKER mode. The first row contains the
 task's current tags; the second contains reusable tags that can be added plus a
@@ -150,9 +184,20 @@ Selecting a task's due-date field opens DATE PICKER mode:
 | `d` / `Delete` | Clear the due date |
 | `Esc` / `q` | Cancel without changing the due date |
 
-Input dialogs use `Enter` to confirm, `Esc` or `q` to cancel, and `Ctrl-U` to
-clear. The CLI continues to accept dates as `YYYY-MM-DD`; tags are managed
-through TAG PICKER mode in the TUI.
+Input dialogs use a cursor-aware editing buffer. Arrow keys, Home/End,
+Backspace/Delete, and the editor's Emacs-style word and undo/redo bindings work
+without moving the cursor out of the textbox. `Enter` confirms and `Esc`
+cancels. While typing, `q` and `?` insert those literal characters; use
+`Ctrl-/` to open a compact keymap containing only the controls relevant to the
+active textarea.
+
+`Ctrl-G` temporarily leaves the TUI and opens the current textbox contents in
+the command configured by `$EDITOR` (including commands with arguments, such as
+`nvim -f`). Writing and quitting the editor returns the edited contents to the
+textbox without submitting them; press `Enter` in tdo when ready. Titles,
+column names, checklist items, and tag names are normalized back to one line,
+while task descriptions retain multiple lines. The CLI continues to accept
+dates as `YYYY-MM-DD`; tags are managed through TAG PICKER mode in the TUI.
 
 Below the editable fields, the `History` section shows the task's Git-backed
 timeline with a compact, aligned relative-time column (`8 minutes ago`,
@@ -162,15 +207,21 @@ moves, creation, and other single-value events use muted gray. The newest events
 appear first. If a very long history does not fit in the current terminal, the
 panel reports how many earlier events are clipped.
 
-Single-value events stay inline (`Added due date: 2026-08-05`). Only true
-before/after changes use indented diff rows. Cross-column moves show column names
-without numeric positions (`Moved from TODO to DOING`); same-column movement is
-shown as `Reordered within TODO`.
+Single-value events stay inline (`Added due date: 2026-08-05`). Checklist status
+changes read `Checked Run tests` or `Unchecked Run tests`. Only other true
+before/after changes use indented diff rows. Cross-column moves show column
+names without numeric positions (`Moved from TODO to DOING`); same-column
+movement is shown as `Reordered within TODO`.
 
-Input dialogs wrap and grow as text is entered. Task cards also grow vertically
-to show their complete wrapped title. Colored tags and due dates appear below
-the title as hanging-indented bullet items, and every line required by that
-metadata remains visible; card hit-testing uses the same dynamic geometry.
+Input dialogs wrap and grow as text is entered, keep the editing cursor visible,
+and use the normal modal background rather than a textbox highlight.
+Continuation lines align with the text-content column, with one column of right
+padding and one blank row between the content and keymap hints. Task cards also
+grow vertically to show their complete wrapped title. Colored tags and due dates
+appear below the title as hanging-indented bullet items. A task with checklist
+items adds `- [ ] X / Y`, where `X` is the completed count; a fully completed
+checklist uses `- [x] Y / Y`. Every line required by that metadata remains
+visible, and card hit-testing uses the same dynamic geometry.
 
 ## CLI and agent use
 
@@ -241,6 +292,9 @@ push = "never"                 # never | every_change | interval
 push_interval_seconds = 300
 remote = "origin"
 
+[input]
+mouse = true                    # false disables capture, actions, and mouse UI
+
 [theme]
 background = "black"
 accent = "orange"
@@ -255,7 +309,8 @@ success = "green"
 Theme values accept standard terminal color names or quoted `#RRGGBB` values.
 Use `tdo config path` to locate the file and `tdo config show` (optionally with
 `--json`) to inspect the effective settings. `~` is expanded in the repository
-path.
+path. Existing config files that omit `[input]` retain mouse support by default;
+add the section above and set `mouse = false` for a keyboard-only TUI.
 
 Push behavior:
 
@@ -278,6 +333,18 @@ git -C ~/.local/share/tdo remote add origin git@github.com:OWNER/BOARD-DATA.git
 The persistence repository is intentionally separate from this source-code
 repository. Navigation, opening dialogs, and cancelled edits do not change the
 persisted state and therefore do not create commits.
+
+Open TUI instances monitor the shared manifest and reload a newly committed
+board within the normal 250 ms event-loop interval. Selection follows stable
+column/task IDs, so a selected task remains selected if another process moves
+it. Reloading pauses while an input, picker, confirmation, help window, or MOVE
+mode is active so partially entered work is never silently discarded, then
+resumes when the TUI returns to a stable board/details view. Every save also
+checks its original Git revision; if another process committed first, the stale
+save is rejected and the newer committed board is loaded instead of being
+overwritten. An OS-level repository-local lock serializes the short write and
+commit phase across TUI/CLI processes and is released automatically on process
+exit.
 
 ## Storage format
 

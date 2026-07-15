@@ -43,6 +43,26 @@ pub struct Task {
 pub struct ChecklistItem {
     pub text: String,
     pub completed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub added_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+impl ChecklistItem {
+    pub fn new(text: String) -> Self {
+        Self {
+            text,
+            completed: false,
+            added_at: Some(Utc::now()),
+            completed_at: None,
+        }
+    }
+
+    pub fn toggle(&mut self) {
+        self.completed = !self.completed;
+        self.completed_at = self.completed.then(Utc::now);
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -278,6 +298,24 @@ const fn default_next_tag_id() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checklist_timestamps_are_backward_compatible_and_track_completion() {
+        let legacy: ChecklistItem =
+            serde_json::from_str(r#"{"text":"Legacy item","completed":true}"#).unwrap();
+        assert_eq!(legacy.added_at, None);
+        assert_eq!(legacy.completed_at, None);
+
+        let mut item = ChecklistItem::new("New item".into());
+        assert!(item.added_at.is_some());
+        assert_eq!(item.completed_at, None);
+        item.toggle();
+        assert!(item.completed);
+        assert!(item.completed_at.is_some());
+        item.toggle();
+        assert!(!item.completed);
+        assert_eq!(item.completed_at, None);
+    }
 
     #[test]
     fn repairs_stale_id_counters() {

@@ -47,6 +47,20 @@ pub enum TaskHistoryKind {
     },
 }
 
+pub fn checklist_status_item(field: &str) -> Option<String> {
+    let encoded = field.strip_prefix("checklist status for ")?;
+    Some(serde_json::from_str(encoded).unwrap_or_else(|_| encoded.trim_matches('"').to_owned()))
+}
+
+pub fn describe_checklist_status_change(field: &str, to: &str) -> Option<String> {
+    let item = checklist_status_item(field)?;
+    match to {
+        "complete" => Some(format!("Checked {item}")),
+        "incomplete" => Some(format!("Unchecked {item}")),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Copy)]
 struct TaskLocation<'a> {
     column_id: u64,
@@ -396,6 +410,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn checklist_status_changes_have_concise_descriptions() {
+        let field = "checklist status for \"Run tests\"";
+        assert_eq!(
+            describe_checklist_status_change(field, "complete").as_deref(),
+            Some("Checked Run tests")
+        );
+        assert_eq!(
+            describe_checklist_status_change(field, "incomplete").as_deref(),
+            Some("Unchecked Run tests")
+        );
+        assert_eq!(describe_checklist_status_change("title", "complete"), None);
+    }
+
+    #[test]
     fn derives_edits_tags_checklist_and_moves_from_snapshots() {
         let created = Utc.with_ymd_and_hms(2026, 7, 15, 10, 0, 0).unwrap();
         let edited = created + Duration::minutes(5);
@@ -412,6 +440,8 @@ mod tests {
         task.checklist.push(ChecklistItem {
             text: "Verify it".into(),
             completed: false,
+            added_at: None,
+            completed_at: None,
         });
 
         let mut third = second.clone();
@@ -446,6 +476,8 @@ mod tests {
                 .map(|name| ChecklistItem {
                     text: (*name).into(),
                     completed: false,
+                    added_at: None,
+                    completed_at: None,
                 })
                 .collect::<Vec<_>>()
         };

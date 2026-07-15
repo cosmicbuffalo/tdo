@@ -9,7 +9,7 @@ use crate::{
         AppConfig, ChecklistCommand, Cli, ColumnCommand, Command, ConfigCommand, TagCommand,
         TaskCommand,
     },
-    history::{TaskHistoryEvent, TaskHistoryKind},
+    history::{TaskHistoryEvent, TaskHistoryKind, describe_checklist_status_change},
     model::{
         Board, ChecklistItem, Column, TAG_COLOR_PALETTE, TagDefinition, Task, normalize_tag_color,
     },
@@ -251,9 +251,8 @@ fn run_task(command: &TaskCommand, board: &mut Board, store: &Store, json: bool)
 fn describe_history_event(event: &TaskHistoryEvent) -> String {
     match &event.kind {
         TaskHistoryKind::Created => "Created task".into(),
-        TaskHistoryKind::Changed { field, from, to } => {
-            format!("Changed {field} from {from:?} to {to:?}")
-        }
+        TaskHistoryKind::Changed { field, from, to } => describe_checklist_status_change(field, to)
+            .unwrap_or_else(|| format!("Changed {field} from {from:?} to {to:?}")),
         TaskHistoryKind::Added { field, value } => format!("Added {field}: {value}"),
         TaskHistoryKind::Removed { field, value } => format!("Removed {field}: {value}"),
         TaskHistoryKind::TagAdded(tag) => format!("Added tag: {tag}"),
@@ -283,10 +282,7 @@ fn run_checklist(
             let (column, task, _) = find_task(board, *task_id)?;
             board.columns[column].tasks[task]
                 .checklist
-                .push(ChecklistItem {
-                    text,
-                    completed: false,
-                });
+                .push(ChecklistItem::new(text));
             (*task_id, format!("Add checklist item to task {task_id}"))
         }
         ChecklistCommand::Edit {
@@ -301,7 +297,7 @@ fn run_checklist(
         }
         ChecklistCommand::Toggle { task_id, item } => {
             let checklist_item = find_checklist_item_mut(board, *task_id, *item)?;
-            checklist_item.completed = !checklist_item.completed;
+            checklist_item.toggle();
             (*task_id, format!("Toggle checklist item on task {task_id}"))
         }
         ChecklistCommand::Remove { task_id, item } => {

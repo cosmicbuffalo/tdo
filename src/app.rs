@@ -4,6 +4,7 @@ use std::{
     collections::HashMap,
     time::{SystemTime, UNIX_EPOCH},
 };
+use tui_textarea::{CursorMove, TextArea};
 
 use crate::history::TaskHistory;
 use crate::model::{Board, ChecklistItem, MAX_COLUMNS, TAG_COLOR_PALETTE};
@@ -13,6 +14,7 @@ pub enum Action {
     None,
     Quit,
     Save(String),
+    EditTextExternally,
 }
 
 #[derive(Clone, Debug)]
@@ -50,8 +52,13 @@ pub enum DeleteChoice {
 #[derive(Clone, Debug)]
 pub struct InputState {
     pub kind: InputKind,
-    pub text: String,
+    pub editor: TextEditor,
     return_to: ReturnTo,
+}
+
+#[derive(Clone, Debug)]
+pub struct TextEditor {
+    area: TextArea<'static>,
 }
 
 #[derive(Clone, Debug)]
@@ -76,7 +83,7 @@ pub enum TagPickerRow {
 
 #[derive(Clone, Debug)]
 pub struct NewTagState {
-    pub name: String,
+    pub name: TextEditor,
     pub color_index: usize,
     pub field: NewTagField,
     picker: TagPickerState,
@@ -113,12 +120,47 @@ pub struct MoveState {
     origin_task: usize,
 }
 
+impl TextEditor {
+    fn new(text: impl AsRef<str>) -> Self {
+        let mut editor = Self {
+            area: TextArea::default(),
+        };
+        editor.set_text(text.as_ref());
+        editor
+    }
+
+    pub fn text(&self) -> String {
+        self.area.lines().join("\n")
+    }
+
+    pub fn lines(&self) -> &[String] {
+        self.area.lines()
+    }
+
+    pub fn cursor(&self) -> (usize, usize) {
+        self.area.cursor()
+    }
+
+    fn input(&mut self, key: KeyEvent) {
+        self.area.input(key);
+    }
+
+    fn set_text(&mut self, text: &str) {
+        let normalized = text.replace("\r\n", "\n");
+        self.area = TextArea::new(normalized.split('\n').map(str::to_owned).collect());
+        self.area.move_cursor(CursorMove::Bottom);
+        self.area.move_cursor(CursorMove::End);
+    }
+}
+
 pub struct App {
     pub board: Board,
     pub task_history: TaskHistory,
     pub task_history_earlier: HashMap<u64, usize>,
     pub selected_column: usize,
     pub selected_task: Option<usize>,
+    pub task_detail_scroll: usize,
+    pub task_detail_follow_cursor: bool,
     pub mode: Mode,
     pub status: Option<String>,
 }
@@ -131,6 +173,8 @@ impl App {
             task_history_earlier: HashMap::new(),
             selected_column: 0,
             selected_task: None,
+            task_detail_scroll: 0,
+            task_detail_follow_cursor: true,
             mode: Mode::Board,
             status: None,
         }
@@ -141,7 +185,8 @@ impl App {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return Action::Quit;
         }
-        if key.code == KeyCode::Char('q') {
+        let editing_text = self.is_text_editor_active();
+        if key.code == KeyCode::Char('q') && !editing_text {
             return if self.close_floating_mode() {
                 Action::None
             } else {
@@ -154,7 +199,13 @@ impl App {
             }
             return Action::None;
         }
-        if key.code == KeyCode::Char('?') {
+        let control_slash = (key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(
+                key.code,
+                KeyCode::Char('/') | KeyCode::Char('_') | KeyCode::Char('7')
+            ))
+            || key.code == KeyCode::Char('\u{1f}');
+        if control_slash || (key.code == KeyCode::Char('?') && !editing_text) {
             self.mode = Mode::Help {
                 return_to: Box::new(self.mode.clone()),
             };
@@ -182,12 +233,123 @@ impl App {
         self.status = Some(format!("error: {error:#}"));
     }
 
+    pub fn can_reload_external_changes(&self) -> bool {
+        matches!(
+            self.mode,
+            Mode::Board | Mode::TaskDetails { .. } | Mode::ColumnDetails { .. }
+        )
+    }
+
+    pub fn replace_board_from_external_change(&mut self, board: Board) {
+        let selected_column_id = self
+            .board
+            .columns
+            .get(self.selected_column)
+            .map(|column| column.id);
+        let selected_task_id = self.selected_task.and_then(|task| {
+            self.board
+                .columns
+                .get(self.selected_column)
+                .and_then(|column| column.tasks.get(task))
+                .map(|task| task.id)
+        });
+        let previous_mode = self.mode.clone();
+        self.board = board;
+
+        let selected_task = selected_task_id.and_then(|task_id| {
+            self.board
+                .columns
+                .iter()
+                .enumerate()
+                .find_map(|(column_index, column)| {
+                    column
+                        .tasks
+                        .iter()
+                        .position(|task| task.id == task_id)
+                        .map(|task_index| (column_index, task_index))
+                })
+        });
+        if let Some((column, task)) = selected_task {
+            self.selected_column = column;
+            self.selected_task = Some(task);
+        } else {
+            self.selected_column = selected_column_id
+                .and_then(|column_id| {
+                    self.board
+                        .columns
+                        .iter()
+                        .position(|column| column.id == column_id)
+                })
+                .unwrap_or(0)
+                .min(self.board.columns.len().saturating_sub(1));
+            self.selected_task = None;
+        }
+
+        self.mode = match previous_mode {
+            Mode::TaskDetails { cursor } if self.selected_task.is_some() => Mode::TaskDetails {
+                cursor: cursor.min(self.task_detail_count().saturating_sub(1)),
+            },
+            Mode::ColumnDetails { cursor } => Mode::ColumnDetails { cursor },
+            _ => Mode::Board,
+        };
+        self.task_history.clear();
+        self.task_history_earlier.clear();
+        self.task_detail_follow_cursor = true;
+        self.status = Some("reloaded external board changes".into());
+    }
+
     pub fn select_target(&mut self, column: usize, task: Option<usize>) {
         if !matches!(self.mode, Mode::Board) || column >= self.board.columns.len() {
             return;
         }
         self.selected_column = column;
         self.selected_task = task.filter(|index| *index < self.current_column().tasks.len());
+    }
+
+    pub fn open_selected_task_details(&mut self) {
+        if matches!(self.mode, Mode::Board) && self.selected_task.is_some() {
+            self.task_detail_scroll = 0;
+            self.task_detail_follow_cursor = true;
+            self.mode = Mode::TaskDetails { cursor: 0 };
+        }
+    }
+
+    pub fn close_task_details(&mut self) {
+        if matches!(self.mode, Mode::TaskDetails { .. }) {
+            self.mode = Mode::Board;
+        }
+    }
+
+    pub fn scroll_task_details(&mut self, lines: isize) {
+        if !matches!(self.mode, Mode::TaskDetails { .. }) {
+            return;
+        }
+        self.task_detail_follow_cursor = false;
+        self.task_detail_scroll = if lines < 0 {
+            self.task_detail_scroll.saturating_sub(lines.unsigned_abs())
+        } else {
+            self.task_detail_scroll.saturating_add(lines as usize)
+        };
+    }
+
+    pub fn click_checklist_item(&mut self, index: usize) -> Action {
+        if index >= self.current_task().checklist.len() {
+            return Action::None;
+        }
+        self.mode = Mode::TaskDetails { cursor: index + 4 };
+        self.task_detail_follow_cursor = true;
+        self.toggle_checklist_item(index)
+    }
+
+    pub fn toggle_checklist_item(&mut self, index: usize) -> Action {
+        if !matches!(self.mode, Mode::TaskDetails { .. }) {
+            return Action::None;
+        }
+        let Some(item) = self.current_task_mut().checklist.get_mut(index) else {
+            return Action::None;
+        };
+        item.toggle();
+        Action::Save("Toggle checklist item".into())
     }
 
     fn handle_board_key(&mut self, key: KeyEvent) -> Action {
@@ -207,11 +369,11 @@ impl App {
             KeyCode::Char('m') if self.selected_task.is_some() => self.begin_move(),
             KeyCode::Char('D') => self.begin_delete(),
             KeyCode::Enter => {
-                self.mode = if self.selected_task.is_some() {
-                    Mode::TaskDetails { cursor: 0 }
+                if self.selected_task.is_some() {
+                    self.open_selected_task_details();
                 } else {
-                    Mode::ColumnDetails { cursor: 0 }
-                };
+                    self.mode = Mode::ColumnDetails { cursor: 0 };
+                }
             }
             KeyCode::Up | KeyCode::Char('k') => self.select_up(),
             KeyCode::Down | KeyCode::Char('j') => self.select_down(),
@@ -272,11 +434,13 @@ impl App {
         match key.code {
             KeyCode::Esc => self.mode = Mode::Board,
             KeyCode::Up | KeyCode::Left | KeyCode::Char('k') | KeyCode::Char('h') => {
+                self.task_detail_follow_cursor = true;
                 self.mode = Mode::TaskDetails {
                     cursor: cursor.saturating_sub(1),
                 };
             }
             KeyCode::Down | KeyCode::Right | KeyCode::Char('j') | KeyCode::Char('l') => {
+                self.task_detail_follow_cursor = true;
                 self.mode = Mode::TaskDetails {
                     cursor: (cursor + 1).min(count.saturating_sub(1)),
                 };
@@ -298,16 +462,12 @@ impl App {
             }
             KeyCode::Char(' ') => {
                 if let Some(index) = self.checklist_index_at(cursor) {
-                    let item = &mut self.current_task_mut().checklist[index];
-                    item.completed = !item.completed;
-                    return Action::Save("Toggle checklist item".into());
+                    return self.toggle_checklist_item(index);
                 }
             }
             KeyCode::Enter => {
                 if let Some(index) = self.checklist_index_at(cursor) {
-                    let item = &mut self.current_task_mut().checklist[index];
-                    item.completed = !item.completed;
-                    return Action::Save("Toggle checklist item".into());
+                    return self.toggle_checklist_item(index);
                 }
                 self.edit_task_field(cursor);
             }
@@ -346,26 +506,14 @@ impl App {
                 }
             }
             KeyCode::Enter => return self.submit_input(),
-            KeyCode::Backspace => {
+            KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                return Action::EditTextExternally;
+            }
+            _ => {
                 if let Mode::Input(input) = &mut self.mode {
-                    input.text.pop();
+                    input.editor.input(key);
                 }
             }
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if let Mode::Input(input) = &mut self.mode {
-                    input.text.clear();
-                }
-            }
-            KeyCode::Char(character)
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
-                if let Mode::Input(input) = &mut self.mode {
-                    input.text.push(character);
-                }
-            }
-            _ => {}
         }
         Action::None
     }
@@ -476,6 +624,13 @@ impl App {
         };
         match key.code {
             KeyCode::Esc => self.mode = Mode::TagPicker(state.picker),
+            KeyCode::Char('g')
+                if state.field == NewTagField::Name
+                    && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.mode = Mode::NewTag(state);
+                return Action::EditTextExternally;
+            }
             KeyCode::Tab => {
                 state.field = match state.field {
                     NewTagField::Name => NewTagField::Color,
@@ -512,17 +667,8 @@ impl App {
                 self.mode = Mode::NewTag(state);
             }
             KeyCode::Enter => return self.submit_new_tag(state),
-            KeyCode::Backspace if state.field == NewTagField::Name => {
-                state.name.pop();
-                self.mode = Mode::NewTag(state);
-            }
-            KeyCode::Char(character)
-                if state.field == NewTagField::Name
-                    && !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
-                state.name.push(character);
+            _ if state.field == NewTagField::Name => {
+                state.name.input(key);
                 self.mode = Mode::NewTag(state);
             }
             _ => {}
@@ -560,7 +706,7 @@ impl App {
         let Mode::Input(input) = self.mode.clone() else {
             return Action::None;
         };
-        let text = input.text.trim().to_owned();
+        let text = input.editor.text().trim().to_owned();
         match input.kind {
             InputKind::AddColumn => {
                 if !self.require_text(&text, "column name") {
@@ -613,10 +759,9 @@ impl App {
                 if !self.require_text(&text, "checklist item") {
                     return Action::None;
                 }
-                self.current_task_mut().checklist.push(ChecklistItem {
-                    text,
-                    completed: false,
-                });
+                self.current_task_mut()
+                    .checklist
+                    .push(ChecklistItem::new(text));
                 self.restore_return_mode(input.return_to);
                 Action::Save("Add checklist item".into())
             }
@@ -633,11 +778,11 @@ impl App {
 
     fn edit_task_field(&mut self, cursor: usize) {
         let checklist_len = self.current_task().checklist.len();
-        if cursor == 2 + checklist_len {
+        if cursor == 2 {
             self.open_tag_picker(ReturnTo::TaskDetails(cursor));
             return;
         }
-        if cursor == 3 + checklist_len {
+        if cursor == 3 {
             self.open_date_picker(ReturnTo::TaskDetails(cursor));
             return;
         }
@@ -647,8 +792,8 @@ impl App {
                 InputKind::TaskDescription,
                 self.current_task().description.clone(),
             ),
-            value if value < 2 + checklist_len => {
-                let index = value - 2;
+            value if value >= 4 && value < 4 + checklist_len => {
+                let index = value - 4;
                 (
                     InputKind::EditChecklistItem(index),
                     self.current_task().checklist[index].text.clone(),
@@ -803,9 +948,10 @@ impl App {
     }
 
     fn open_input(&mut self, kind: InputKind, text: impl Into<String>, return_to: ReturnTo) {
+        let text = text.into();
         self.mode = Mode::Input(InputState {
             kind,
-            text: text.into(),
+            editor: TextEditor::new(text),
             return_to,
         });
     }
@@ -838,7 +984,7 @@ impl App {
             .unwrap_or(0)
             ^ self.board.next_tag_id as usize;
         self.mode = Mode::NewTag(NewTagState {
-            name: String::new(),
+            name: TextEditor::new(""),
             color_index: seed % TAG_COLOR_PALETTE.len(),
             field: NewTagField::Name,
             picker,
@@ -846,7 +992,7 @@ impl App {
     }
 
     fn submit_new_tag(&mut self, mut state: NewTagState) -> Action {
-        let name = state.name.trim().trim_start_matches('#').to_owned();
+        let name = state.name.text().trim().trim_start_matches('#').to_owned();
         if name.is_empty() {
             self.status = Some("tag name cannot be empty".into());
             self.mode = Mode::NewTag(state);
@@ -929,7 +1075,7 @@ impl App {
     }
 
     fn checklist_index_at(&self, cursor: usize) -> Option<usize> {
-        let index = cursor.checked_sub(2)?;
+        let index = cursor.checked_sub(4)?;
         (index < self.current_task().checklist.len()).then_some(index)
     }
 
@@ -947,6 +1093,47 @@ impl App {
 
     pub fn current_task(&self) -> &crate::model::Task {
         &self.current_column().tasks[self.selected_task.unwrap()]
+    }
+
+    pub fn active_text_editor_content(&self) -> Option<String> {
+        match &self.mode {
+            Mode::Input(input) => Some(input.editor.text()),
+            Mode::NewTag(state) if state.field == NewTagField::Name => Some(state.name.text()),
+            _ => None,
+        }
+    }
+
+    pub fn replace_active_text_editor_content(&mut self, text: &str) -> bool {
+        let normalized = text.replace("\r\n", "\n");
+        match &mut self.mode {
+            Mode::Input(input) => {
+                let text = if input.kind.allows_multiline() {
+                    normalized
+                } else {
+                    normalized.split('\n').collect::<Vec<_>>().join(" ")
+                };
+                input.editor.set_text(&text);
+                true
+            }
+            Mode::NewTag(state) if state.field == NewTagField::Name => {
+                state
+                    .name
+                    .set_text(&normalized.split('\n').collect::<Vec<_>>().join(" "));
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn is_text_editor_active(&self) -> bool {
+        matches!(&self.mode, Mode::Input(_))
+            || matches!(
+                &self.mode,
+                Mode::NewTag(NewTagState {
+                    field: NewTagField::Name,
+                    ..
+                })
+            )
     }
 
     fn current_task_mut(&mut self) -> &mut crate::model::Task {
@@ -969,8 +1156,8 @@ impl InputKind {
         }
     }
 
-    pub fn hint(&self) -> &'static str {
-        "enter confirms · esc cancels"
+    fn allows_multiline(&self) -> bool {
+        matches!(self, Self::TaskDescription)
     }
 }
 
@@ -1051,18 +1238,75 @@ mod tests {
         app.handle_key(key(KeyCode::Char('a')));
         app.handle_key(key(KeyCode::Char('N')));
         app.handle_key(key(KeyCode::Char('?')));
+        assert!(matches!(&app.mode, Mode::Input(_)));
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL));
         assert!(matches!(app.mode, Mode::Help { .. }));
 
         app.handle_key(key(KeyCode::Esc));
 
-        let Mode::Input(input) = app.mode else {
+        let Mode::Input(input) = &app.mode else {
             panic!("help did not restore the input dialog");
         };
-        assert_eq!(input.text, "N");
+        assert_eq!(input.editor.text(), "N?");
+        // Legacy terminal encoding sends Ctrl-/ as the same byte as Ctrl-_, which
+        // crossterm exposes as Ctrl-7. Enhanced keyboard protocols retain '/'.
+        app.handle_key(KeyEvent::new(KeyCode::Char('7'), KeyModifiers::CONTROL));
+        assert!(matches!(app.mode, Mode::Help { .. }));
     }
 
     #[test]
-    fn q_closes_floating_modes_and_ctrl_c_always_quits() {
+    fn input_editor_moves_inserts_deletes_and_requests_external_editing() {
+        let mut app = App::new(Board::default());
+        app.handle_key(key(KeyCode::Char('a')));
+        for character in "abcd".chars() {
+            app.handle_key(key(KeyCode::Char(character)));
+        }
+        app.handle_key(key(KeyCode::Left));
+        app.handle_key(key(KeyCode::Left));
+        app.handle_key(key(KeyCode::Char('X')));
+        app.handle_key(key(KeyCode::Backspace));
+        app.handle_key(key(KeyCode::Home));
+        app.handle_key(key(KeyCode::Delete));
+        app.handle_key(key(KeyCode::End));
+        app.handle_key(key(KeyCode::Char('?')));
+        app.handle_key(key(KeyCode::Char('q')));
+
+        let Mode::Input(input) = &app.mode else {
+            panic!("text editing should keep the input dialog open");
+        };
+        assert_eq!(input.editor.text(), "bcd?q");
+        assert_eq!(input.editor.cursor(), (0, 5));
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL)),
+            Action::EditTextExternally
+        );
+        assert!(app.replace_active_text_editor_content("external\nedit"));
+        let Mode::Input(input) = &app.mode else {
+            unreachable!()
+        };
+        assert_eq!(input.editor.text(), "external edit");
+        assert_eq!(input.editor.cursor(), (0, 13));
+    }
+
+    #[test]
+    fn external_task_description_edits_keep_multiple_lines() {
+        let mut board = Board::default();
+        board.add_task(0, "described".into());
+        let mut app = App::new(board);
+        app.selected_task = Some(0);
+        app.mode = Mode::TaskDetails { cursor: 1 };
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(app.replace_active_text_editor_content("first line\nsecond line"));
+        let Mode::Input(input) = &app.mode else {
+            panic!("description input should remain open");
+        };
+        assert_eq!(input.editor.text(), "first line\nsecond line");
+        assert_eq!(input.editor.cursor(), (1, 11));
+    }
+
+    #[test]
+    fn q_types_in_text_fields_but_closes_other_floats_and_ctrl_c_always_quits() {
         let mut app = App::new(Board::default());
         app.mode = Mode::ColumnDetails { cursor: 0 };
         assert_eq!(app.handle_key(key(KeyCode::Char('q'))), Action::None);
@@ -1070,10 +1314,15 @@ mod tests {
 
         app.mode = Mode::Input(InputState {
             kind: InputKind::AddTask,
-            text: String::new(),
+            editor: TextEditor::new(""),
             return_to: ReturnTo::Board,
         });
         assert_eq!(app.handle_key(key(KeyCode::Char('q'))), Action::None);
+        let Mode::Input(input) = &app.mode else {
+            panic!("q should keep the input dialog open");
+        };
+        assert_eq!(input.editor.text(), "q");
+        app.handle_key(key(KeyCode::Esc));
         assert!(matches!(&app.mode, Mode::Board));
 
         assert_eq!(app.handle_key(key(KeyCode::Char('q'))), Action::Quit);
@@ -1238,5 +1487,71 @@ mod tests {
         );
         assert_eq!(app.current_task().tags, ["existing", "project"]);
         assert_eq!(app.board.tag_by_name("project").unwrap().color, color);
+    }
+
+    #[test]
+    fn checklist_rows_follow_metadata_and_toggles_record_completion_time() {
+        let mut board = Board::default();
+        board.add_task(0, "checklist".into());
+        board.columns[0].tasks[0]
+            .checklist
+            .push(ChecklistItem::new("Run tests".into()));
+        let mut app = App::new(board);
+        app.selected_task = Some(0);
+        app.mode = Mode::TaskDetails { cursor: 4 };
+
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char(' '))),
+            Action::Save("Toggle checklist item".into())
+        );
+        assert!(app.current_task().checklist[0].completed);
+        assert!(app.current_task().checklist[0].completed_at.is_some());
+    }
+
+    #[test]
+    fn mouse_style_checklist_actions_select_toggle_and_scroll_details() {
+        let mut board = Board::default();
+        board.add_task(0, "checklist".into());
+        board.columns[0].tasks[0]
+            .checklist
+            .push(ChecklistItem::new("Click me".into()));
+        let mut app = App::new(board);
+        app.selected_task = Some(0);
+        app.open_selected_task_details();
+
+        assert_eq!(
+            app.click_checklist_item(0),
+            Action::Save("Toggle checklist item".into())
+        );
+        assert!(app.current_task().checklist[0].completed);
+        assert!(matches!(app.mode, Mode::TaskDetails { cursor: 4 }));
+        app.scroll_task_details(6);
+        assert_eq!(app.task_detail_scroll, 6);
+        assert!(!app.task_detail_follow_cursor);
+        app.close_task_details();
+        assert!(matches!(app.mode, Mode::Board));
+    }
+
+    #[test]
+    fn external_reload_follows_a_selected_task_by_stable_id() {
+        let mut board = Board::default();
+        board.add_column("DONE".into()).unwrap();
+        board.add_task(0, "selected".into());
+        let mut app = App::new(board.clone());
+        app.selected_task = Some(0);
+        app.mode = Mode::TaskDetails { cursor: 3 };
+
+        let task = board.columns[0].tasks.remove(0);
+        board.columns[1].tasks.push(task);
+        app.replace_board_from_external_change(board);
+
+        assert_eq!(app.selected_column, 1);
+        assert_eq!(app.selected_task, Some(0));
+        assert_eq!(app.current_task().title, "selected");
+        assert!(matches!(app.mode, Mode::TaskDetails { cursor: 3 }));
+        assert_eq!(
+            app.status.as_deref(),
+            Some("reloaded external board changes")
+        );
     }
 }

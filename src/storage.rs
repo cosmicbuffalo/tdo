@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
@@ -9,6 +11,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
+use fs2::FileExt;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
@@ -37,7 +40,16 @@ pub struct Store {
     push_interval_seconds: u64,
     remote: String,
     last_saved_board: RefCell<Option<Board>>,
+    last_seen_revision: RefCell<Option<String>>,
     next_event_id: RefCell<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StateMarker {
+    modified: SystemTime,
+    length: u64,
+    #[cfg(unix)]
+    inode: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -100,6 +112,7 @@ impl Store {
             push_interval_seconds: 300,
             remote: "origin".into(),
             last_saved_board: RefCell::new(None),
+            last_seen_revision: RefCell::new(None),
             next_event_id: RefCell::new(1),
         }
     }
@@ -111,6 +124,7 @@ impl Store {
             push_interval_seconds: config.push_interval_seconds,
             remote: config.remote.clone(),
             last_saved_board: RefCell::new(None),
+            last_seen_revision: RefCell::new(None),
             next_event_id: RefCell::new(1),
         }
     }
@@ -119,10 +133,37 @@ impl Store {
         &self.root
     }
 
+    pub fn state_marker(&self) -> Result<StateMarker> {
+        let metadata = fs::metadata(self.root.join(MANIFEST_FILE))
+            .context("inspect persistence manifest for external changes")?;
+        Ok(StateMarker {
+            modified: metadata
+                .modified()
+                .context("read persistence manifest modification time")?,
+            length: metadata.len(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+        })
+    }
+
+    pub fn current_revision(&self) -> Result<String> {
+        self.current_head()
+    }
+
+    pub fn reload_committed_state(&self) -> Result<(String, Board)> {
+        let revision = self.current_head()?;
+        let (board, manifest) = self.load_v2_revision_state(&revision)?;
+        *self.last_saved_board.borrow_mut() = Some(board.clone());
+        *self.last_seen_revision.borrow_mut() = Some(revision.clone());
+        *self.next_event_id.borrow_mut() = manifest.next_event_id;
+        Ok((revision, board))
+    }
+
     pub fn load_or_create(&self) -> Result<Board> {
         fs::create_dir_all(&self.root)
             .with_context(|| format!("create data directory {}", self.root.display()))?;
         self.ensure_repository()?;
+        let _save_lock = self.lock_saves()?;
         self.recover_pending_save()?;
 
         let board = if self.root.join(MANIFEST_FILE).exists() {
@@ -162,11 +203,22 @@ impl Store {
         };
 
         *self.last_saved_board.borrow_mut() = Some(board.clone());
+        *self.last_seen_revision.borrow_mut() = Some(self.current_head()?);
         Ok(board)
     }
 
     pub fn save(&self, board: &Board, message: &str) -> Result<()> {
         self.ensure_repository()?;
+        let _save_lock = self.lock_saves()?;
+        let current_revision = self.current_head()?;
+        if self
+            .last_seen_revision
+            .borrow()
+            .as_deref()
+            .is_some_and(|revision| revision != current_revision.as_str())
+        {
+            bail!("board changed in another tdo process; reload and retry this edit");
+        }
         let mut validated = board.clone();
         validated
             .validate_and_repair()
@@ -189,6 +241,7 @@ impl Store {
         self.apply_pending_save(&pending)?;
         *self.next_event_id.borrow_mut() = pending.state.manifest.next_event_id;
         *self.last_saved_board.borrow_mut() = Some(validated);
+        *self.last_seen_revision.borrow_mut() = Some(self.current_head()?);
         Ok(())
     }
 
@@ -437,10 +490,16 @@ impl Store {
     }
 
     fn load_v2_revision(&self, revision: &str) -> Result<Board> {
+        self.load_v2_revision_state(revision)
+            .map(|(board, _)| board)
+    }
+
+    fn load_v2_revision_state(&self, revision: &str) -> Result<(Board, StateManifest)> {
         let manifest_bytes = self.git_file(revision, MANIFEST_FILE)?;
         let manifest: StateManifest =
             serde_json::from_slice(&manifest_bytes).context("parse committed state manifest")?;
-        self.assemble_board(&manifest, |path| self.git_file(revision, path))
+        let board = self.assemble_board(&manifest, |path| self.git_file(revision, path))?;
+        Ok((board, manifest))
     }
 
     fn assemble_board<F>(&self, manifest: &StateManifest, mut read: F) -> Result<Board>
@@ -626,6 +685,24 @@ impl Store {
 
     fn pending_save_path(&self) -> Result<PathBuf> {
         Ok(self.git_dir()?.join("tdo/pending-save.json"))
+    }
+
+    fn lock_saves(&self) -> Result<fs::File> {
+        let path = self.git_dir()?.join("tdo/save.lock");
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("create save lock directory {}", parent.display()))?;
+        }
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("open persistence save lock {}", path.display()))?;
+        file.lock_exclusive()
+            .with_context(|| format!("lock persistence saves through {}", path.display()))?;
+        Ok(file)
     }
 
     fn git_dir(&self) -> Result<PathBuf> {
@@ -1155,6 +1232,33 @@ mod tests {
         let log = String::from_utf8(output.stdout).unwrap();
         assert!(log.contains("Initialize tdo board"));
         assert!(log.contains("Add task First task"));
+    }
+
+    #[test]
+    fn reloads_committed_changes_from_another_store_instance() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("data");
+        let first = Store::new(root.clone());
+        let mut first_board = first.load_or_create().unwrap();
+        let original_revision = first.current_revision().unwrap();
+        let second = Store::new(root);
+        let mut second_board = second.load_or_create().unwrap();
+        second_board.add_task(0, "Added elsewhere".into());
+        second.save(&second_board, "Add task elsewhere").unwrap();
+        first_board.add_task(0, "Stale task".into());
+
+        let error = first.save(&first_board, "Stale save").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("board changed in another tdo process")
+        );
+
+        let (revision, reloaded) = first.reload_committed_state().unwrap();
+
+        assert_ne!(revision, original_revision);
+        assert_ne!(reloaded, first_board);
+        assert_eq!(reloaded.columns[0].tasks[0].title, "Added elsewhere");
     }
 
     #[test]
