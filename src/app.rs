@@ -159,6 +159,9 @@ pub struct App {
     pub task_history_earlier: HashMap<u64, usize>,
     pub selected_column: usize,
     pub selected_task: Option<usize>,
+    column_cursors: HashMap<u64, Option<usize>>,
+    column_scrolls: HashMap<u64, usize>,
+    column_scroll_follows_cursor: HashMap<u64, bool>,
     pub task_detail_scroll: usize,
     pub task_detail_follow_cursor: bool,
     pub mode: Mode,
@@ -173,6 +176,9 @@ impl App {
             task_history_earlier: HashMap::new(),
             selected_column: 0,
             selected_task: None,
+            column_cursors: HashMap::new(),
+            column_scrolls: HashMap::new(),
+            column_scroll_follows_cursor: HashMap::new(),
             task_detail_scroll: 0,
             task_detail_follow_cursor: true,
             mode: Mode::Board,
@@ -272,6 +278,8 @@ impl App {
         if let Some((column, task)) = selected_task {
             self.selected_column = column;
             self.selected_task = Some(task);
+            self.remember_current_column_cursor();
+            self.follow_column_cursor(column);
         } else {
             self.selected_column = selected_column_id
                 .and_then(|column_id| {
@@ -283,6 +291,7 @@ impl App {
                 .unwrap_or(0)
                 .min(self.board.columns.len().saturating_sub(1));
             self.selected_task = None;
+            self.remember_current_column_cursor();
         }
 
         self.mode = match previous_mode {
@@ -302,8 +311,76 @@ impl App {
         if !matches!(self.mode, Mode::Board) || column >= self.board.columns.len() {
             return;
         }
+        self.remember_current_column_cursor();
         self.selected_column = column;
         self.selected_task = task.filter(|index| *index < self.current_column().tasks.len());
+        self.remember_current_column_cursor();
+        if self.selected_task.is_some() {
+            self.follow_column_cursor(column);
+        }
+    }
+
+    fn column_cursor(&self, column: usize) -> Option<usize> {
+        self.board
+            .columns
+            .get(column)
+            .and_then(|column| self.column_cursors.get(&column.id))
+            .copied()
+            .flatten()
+    }
+
+    fn remember_current_column_cursor(&mut self) {
+        let Some(column) = self.board.columns.get(self.selected_column) else {
+            return;
+        };
+        let cursor = self.selected_task.filter(|task| *task < column.tasks.len());
+        self.column_cursors.insert(column.id, cursor);
+    }
+
+    pub fn column_scroll(&self, column: usize) -> usize {
+        self.board
+            .columns
+            .get(column)
+            .and_then(|column| self.column_scrolls.get(&column.id))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub fn set_column_scroll(&mut self, column: usize, start: usize) {
+        let Some(column) = self.board.columns.get(column) else {
+            return;
+        };
+        let max_start = column.tasks.len().saturating_sub(1);
+        self.column_scrolls.insert(column.id, start.min(max_start));
+    }
+
+    pub fn scroll_column(&mut self, column: usize, tasks: isize) {
+        let Some(column_id) = self.board.columns.get(column).map(|column| column.id) else {
+            return;
+        };
+        let current = self.column_scroll(column);
+        let start = if tasks < 0 {
+            current.saturating_sub(tasks.unsigned_abs())
+        } else {
+            current.saturating_add(tasks as usize)
+        };
+        self.set_column_scroll(column, start);
+        self.column_scroll_follows_cursor.insert(column_id, false);
+    }
+
+    pub fn column_scroll_follows_cursor(&self, column: usize) -> bool {
+        self.board
+            .columns
+            .get(column)
+            .and_then(|column| self.column_scroll_follows_cursor.get(&column.id))
+            .copied()
+            .unwrap_or(true)
+    }
+
+    fn follow_column_cursor(&mut self, column: usize) {
+        if let Some(column) = self.board.columns.get(column) {
+            self.column_scroll_follows_cursor.insert(column.id, true);
+        }
     }
 
     pub fn open_selected_task_details(&mut self) {
@@ -685,6 +762,8 @@ impl App {
                 self.board = state.snapshot;
                 self.selected_column = state.origin_column;
                 self.selected_task = Some(state.origin_task);
+                self.remember_current_column_cursor();
+                self.follow_column_cursor(state.origin_column);
                 self.mode = Mode::Board;
                 self.status = Some("move cancelled".into());
             }
@@ -714,8 +793,10 @@ impl App {
                 }
                 match self.board.add_column(text.clone()) {
                     Ok(index) => {
+                        self.remember_current_column_cursor();
                         self.selected_column = index;
                         self.selected_task = None;
+                        self.remember_current_column_cursor();
                         self.restore_return_mode(input.return_to);
                         Action::Save(format!("Add column {text}"))
                     }
@@ -739,6 +820,8 @@ impl App {
                 }
                 let index = self.board.add_task(self.selected_column, text.clone());
                 self.selected_task = Some(index);
+                self.remember_current_column_cursor();
+                self.follow_column_cursor(self.selected_column);
                 self.restore_return_mode(input.return_to);
                 Action::Save(format!("Add task {text}"))
             }
@@ -845,6 +928,7 @@ impl App {
                 };
                 self.selected_column = index - 1;
                 self.selected_task = None;
+                self.remember_current_column_cursor();
                 self.mode = Mode::Board;
                 Action::Save(format!(
                     "Delete column {id} ({title}); move {moved} tasks to prior column"
@@ -873,6 +957,10 @@ impl App {
                 } else {
                     Some(task.min(tasks.len() - 1))
                 };
+                self.remember_current_column_cursor();
+                if self.selected_task.is_some() {
+                    self.follow_column_cursor(column);
+                }
                 self.mode = Mode::Board;
                 Action::Save(format!("Delete task {} ({})", removed.id, removed.title))
             }
@@ -896,6 +984,8 @@ impl App {
         if target != current {
             self.current_column_mut().tasks.swap(current, target);
             self.selected_task = Some(target);
+            self.remember_current_column_cursor();
+            self.follow_column_cursor(self.selected_column);
         }
     }
 
@@ -912,10 +1002,14 @@ impl App {
             .insert(target_index, task);
         self.selected_column = target_column;
         self.selected_task = Some(target_index);
+        self.remember_current_column_cursor();
+        self.follow_column_cursor(target_column);
     }
 
     fn select_up(&mut self) {
         self.selected_task = self.selected_task.and_then(|task| task.checked_sub(1));
+        self.remember_current_column_cursor();
+        self.follow_column_cursor(self.selected_column);
     }
 
     fn select_down(&mut self) {
@@ -925,6 +1019,8 @@ impl App {
             Some(task) if task + 1 < len => Some(task + 1),
             current => current,
         };
+        self.remember_current_column_cursor();
+        self.follow_column_cursor(self.selected_column);
     }
 
     fn select_column(&mut self, delta: isize) {
@@ -933,17 +1029,19 @@ impl App {
     }
 
     fn jump_to_column(&mut self, target: usize) {
-        if target >= self.board.columns.len() {
+        if target >= self.board.columns.len() || target == self.selected_column {
             return;
         }
+        self.remember_current_column_cursor();
         self.selected_column = target;
-        if let Some(task) = self.selected_task {
-            let len = self.current_column().tasks.len();
-            self.selected_task = if len == 0 {
-                None
-            } else {
-                Some(task.min(len - 1))
-            };
+        let len = self.current_column().tasks.len();
+        self.selected_task = self
+            .column_cursor(target)
+            .map(|task| task.min(len.saturating_sub(1)))
+            .filter(|_| len > 0);
+        self.remember_current_column_cursor();
+        if self.selected_task.is_some() {
+            self.follow_column_cursor(target);
         }
     }
 
@@ -1212,6 +1310,37 @@ mod tests {
         app.handle_key(key(KeyCode::Up));
         app.handle_key(key(KeyCode::Up));
         assert_eq!(app.selected_task, None);
+    }
+
+    #[test]
+    fn horizontal_navigation_restores_each_columns_last_cursor() {
+        let mut board = Board::default();
+        board.add_column("DONE".into()).unwrap();
+        for column in 0..2 {
+            for index in 0..5 {
+                board.add_task(column, format!("Task {column}-{index}"));
+            }
+        }
+        let mut app = App::new(board);
+
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.selected_task, Some(1));
+
+        app.handle_key(key(KeyCode::Right));
+        assert_eq!(app.selected_column, 1);
+        assert_eq!(app.selected_task, None);
+        for _ in 0..4 {
+            app.handle_key(key(KeyCode::Down));
+        }
+        assert_eq!(app.selected_task, Some(3));
+
+        app.handle_key(key(KeyCode::Left));
+        assert_eq!(app.selected_column, 0);
+        assert_eq!(app.selected_task, Some(1));
+        app.handle_key(key(KeyCode::Right));
+        assert_eq!(app.selected_column, 1);
+        assert_eq!(app.selected_task, Some(3));
     }
 
     #[test]

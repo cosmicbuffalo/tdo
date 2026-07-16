@@ -212,14 +212,13 @@ pub enum PushMode {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ThemeConfig {
-    pub background: String,
-    pub accent: String,
     pub selected_background: String,
     pub border: String,
     pub text: String,
     pub muted: String,
     pub danger: String,
     pub success: String,
+    pub change: String,
 }
 
 impl Cli {
@@ -289,14 +288,13 @@ impl Default for InputConfig {
 impl Default for ThemeConfig {
     fn default() -> Self {
         Self {
-            background: "black".into(),
-            accent: "orange".into(),
             selected_background: "dark_gray".into(),
             border: "gray".into(),
             text: "white".into(),
             muted: "dark_gray".into(),
             danger: "red".into(),
             success: "green".into(),
+            change: "cyan".into(),
         }
     }
 }

@@ -62,9 +62,10 @@ The cursor can land on a column header or an individual task card. A selected
 header uses the same `▊` cursor rail in its leftmost interior cell and accents
 the connected column outline; its centered label changes to the accent
 foreground without applying a background fill. Task cards are borderless in
-BOARD mode, and the selected card is indicated only by a cursor rail spanning
-all of its visible rows. Normal navigation scrolls horizontally when columns
-are off-screen, and `1`–`9` jumps directly to a column.
+BOARD mode against a black TUI background, and the selected card is indicated
+only by a cursor rail spanning all of its visible rows. Normal navigation
+scrolls horizontally when columns are off-screen, and `1`–`9` jumps directly
+to a column.
 
 All floating-window titles are centered and every floating window has its own
 key-hint row along the bottom. While a window is open, the board hint row keeps
@@ -84,6 +85,7 @@ events, and hides mouse-only controls and hints.
 | `Ctrl-/` | Open the floating keymap anywhere; while editing text it shows only textarea controls |
 | Left click | Select a column header, task card, or a column's empty space |
 | Double-click a task | Select it and open Task Details |
+| Mouse wheel | Scroll the column under the pointer without moving the cursor |
 | Arrow keys or `hjkl` | Move between column headers and task cards |
 | `1`–`9` | Jump to a column |
 | `Enter` | Open details for the selected column or task |
@@ -98,6 +100,13 @@ events, and hides mouse-only controls and hints.
 buttons. Cancel is selected by default; use left/right, `h`/`l`, or `Tab` and
 `Enter` to activate a button. `y` confirms directly, while `n`, `Esc`, or `q`
 cancels.
+
+Each column keeps its own cursor and vertical scroll position when focus moves
+elsewhere, restoring both when focus returns. Cards that only partly fit remain
+visible and are clipped at the bottom; moving the cursor onto one scrolls it
+fully into view. Muted `↑ (X more)` and `↓ (X more)` indicators count the cards
+hidden beyond the corresponding edge and disappear when that edge of the
+column is reached.
 
 Deleting a task removes it and all of its details. Deleting a populated column
 appends its tasks, in order, to the prior column before removing it. The first
@@ -145,7 +154,8 @@ the selected field visible; `Ctrl-U`/`Ctrl-D`, the mouse wheel, or the retained
 page-key bindings can inspect any other part of the document. When content is
 hidden above or below the visible region, centered muted `↑ (more)` and
 `↓ (more)` indicators appear on the corresponding edge of the scroll region.
-They remain hidden when the complete document fits.
+The row immediately above the keymap hints stays blank when there is no content
+below and carries the `↓ (more)` indicator when needed.
 
 Checklist items live in their own `Checklist` section below the metadata. Each
 item is indented and followed by a muted timing row such as
@@ -200,18 +210,24 @@ while task descriptions retain multiple lines. The CLI continues to accept
 dates as `YYYY-MM-DD`; tags are managed through TAG PICKER mode in the TUI.
 
 Below the editable fields, the `History` section shows the task's Git-backed
-timeline with a compact, aligned relative-time column (`8 minutes ago`,
-`2 hours ago`, and so on). Field changes render the prior value in red and the
-new value in green. Tag additions/removals retain the tag's configured color;
-moves, creation, and other single-value events use muted gray. The newest events
-appear first. If a very long history does not fit in the current terminal, the
-panel reports how many earlier events are clipped.
+timeline in three aligned columns: relative timestamp (`8 minutes ago`), event
+type (`added due date`, `added tag`, `removed tag`, `moved`), and event content.
+The type column uses Git-diff colors: added events are green, removed events are
+red, changed/check-toggle events are cyan, and the initial created event uses
+the normal white text color.
+Field changes render the prior value in red and the new value in green. Tag
+additions/removals retain the tag's configured color; moves, creation, and other
+single-value events use muted gray. The newest events appear first. If a very
+long history does not fit in the current terminal, the panel reports how many
+earlier events are clipped.
 
-Single-value events stay inline (`Added due date: 2026-08-05`). Checklist status
-changes read `Checked Run tests` or `Unchecked Run tests`. Only other true
-before/after changes use indented diff rows. Cross-column moves show column
-names without numeric positions (`Moved from TODO to DOING`); same-column
-movement is shown as `Reordered within TODO`.
+Single-value events stay on their event row (`added due date  2026-08-05`).
+Checklist status changes use `checked` or `unchecked` as the type and the item
+text as the content. Checklist item insertions and removals similarly use the
+short types `added` and `removed`, with the item text in the content column.
+Only other true before/after changes use indented diff rows. Cross-column moves
+show column names without numeric positions (`moved  TODO → DOING`);
+same-column movement uses `reordered  within TODO`.
 
 Input dialogs wrap and grow as text is entered, keep the editing cursor visible,
 and use the normal modal background rather than a textbox highlight.
@@ -296,17 +312,19 @@ remote = "origin"
 mouse = true                    # false disables capture, actions, and mouse UI
 
 [theme]
-background = "black"
-accent = "orange"
 selected_background = "dark_gray"
 border = "gray"
 text = "white"
 muted = "dark_gray"
 danger = "red"
 success = "green"
+change = "cyan"
 ```
 
-Theme values accept standard terminal color names or quoted `#RRGGBB` values.
+The TUI background is always true-color `#000000`, independent of the
+terminal's configurable ANSI black palette. Cursor rails, active outlines, and
+selection accents are always true-color orange (`#FF8700`). Remaining theme
+values accept standard terminal color names or quoted `#RRGGBB` values.
 Use `tdo config path` to locate the file and `tdo config show` (optionally with
 `--json`) to inspect the effective settings. `~` is expanded in the repository
 path. Existing config files that omit `[input]` retain mouse support by default;

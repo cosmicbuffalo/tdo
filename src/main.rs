@@ -129,6 +129,11 @@ fn run_event_loop(
     loop {
         reload_external_changes(app, store, &mut known_revision, &mut known_state);
         load_visible_task_history(app, store);
+        let size = terminal.size()?;
+        ui::prepare_board_scrolls(
+            ratatui::layout::Rect::new(0, 0, size.width, size.height),
+            app,
+        );
         terminal.draw(|frame| ui::draw(frame, app, theme))?;
 
         if event::poll(Duration::from_millis(250))? {
@@ -221,9 +226,11 @@ fn run_event_loop(
                     MouseEventKind::ScrollUp => {
                         clicks.reset();
                         let size = terminal.size()?;
-                        ui::scroll_task_details(
+                        ui::scroll_at(
                             ratatui::layout::Rect::new(0, 0, size.width, size.height),
                             app,
+                            mouse.column,
+                            mouse.row,
                             -3,
                             theme,
                         );
@@ -231,9 +238,11 @@ fn run_event_loop(
                     MouseEventKind::ScrollDown => {
                         clicks.reset();
                         let size = terminal.size()?;
-                        ui::scroll_task_details(
+                        ui::scroll_at(
                             ratatui::layout::Rect::new(0, 0, size.width, size.height),
                             app,
+                            mouse.column,
+                            mouse.row,
                             3,
                             theme,
                         );

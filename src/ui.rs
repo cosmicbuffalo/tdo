@@ -15,9 +15,7 @@ use crate::{
         TextEditor,
     },
     config::ThemeConfig,
-    history::{
-        TaskHistoryEvent, TaskHistoryKind, checklist_status_item, describe_checklist_status_change,
-    },
+    history::{TaskHistoryEvent, TaskHistoryKind, checklist_status_item},
     model::{ChecklistItem, TAG_COLOR_PALETTE, TagDefinition, Task},
 };
 
@@ -25,6 +23,8 @@ const MIN_COLUMN_WIDTH: u16 = 26;
 const TASK_CURSOR_WIDTH: u16 = 2;
 const TASK_CARD_GAP: u16 = 1;
 const TASK_CARD_RIGHT_PADDING: u16 = 1;
+const TUI_BACKGROUND: Color = Color::Rgb(0, 0, 0);
+const TUI_ACCENT: Color = Color::Rgb(255, 135, 0);
 
 pub struct Theme {
     background: Color,
@@ -35,6 +35,7 @@ pub struct Theme {
     muted: Color,
     danger: Color,
     success: Color,
+    change: Color,
     mouse_enabled: bool,
 }
 
@@ -58,6 +59,13 @@ struct TaskDetailDocument {
     checklist_ranges: Vec<(usize, std::ops::Range<usize>)>,
 }
 
+struct ColumnCardLayout {
+    start: usize,
+    cards: Vec<(usize, Rect)>,
+    hidden_above: usize,
+    hidden_below: usize,
+}
+
 impl Theme {
     #[cfg(test)]
     pub fn from_config(config: &ThemeConfig) -> Result<Self> {
@@ -66,14 +74,15 @@ impl Theme {
 
     pub fn from_config_with_mouse(config: &ThemeConfig, mouse_enabled: bool) -> Result<Self> {
         Ok(Self {
-            background: parse_color(&config.background)?,
-            accent: parse_color(&config.accent)?,
+            background: TUI_BACKGROUND,
+            accent: TUI_ACCENT,
             selected_background: parse_color(&config.selected_background)?,
             border: parse_color(&config.border)?,
             text: parse_color(&config.text)?,
             muted: parse_color(&config.muted)?,
             danger: parse_color(&config.danger)?,
             success: parse_color(&config.success)?,
+            change: parse_color(&config.change)?,
             mouse_enabled,
         })
     }
@@ -133,7 +142,7 @@ pub fn hit_test(area: Rect, app: &App, x: u16, y: u16, theme: &Theme) -> Option<
         let scroll = task_detail_scroll(app, &document, cursor, content_height);
         let mut visible_line = usize::from(y.saturating_sub(content.y));
         if task_detail_has_scroll_hints(document.lines.len(), content_height) {
-            if visible_line == 0 || visible_line >= content_height.saturating_sub(1) {
+            if visible_line == 0 {
                 return None;
             }
             visible_line -= 1;
@@ -193,6 +202,43 @@ pub fn scroll_task_details_half_page(area: Rect, app: &mut App, down: bool, them
     let half_page = task_detail_visible_rows(document.lines.len(), content_height) / 2;
     let lines = isize::try_from(half_page.max(1)).unwrap_or(isize::MAX);
     scroll_task_details(area, app, if down { lines } else { -lines }, theme);
+}
+
+pub fn prepare_board_scrolls(area: Rect, app: &mut App) {
+    let [board_area, _] = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(area);
+    let lanes = visible_lanes(board_area, app);
+    for (column_index, lane) in lanes {
+        let body = lane_regions(lane).1;
+        let inner = Block::default()
+            .borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM)
+            .inner(body);
+        let start = column_card_layout(inner, app, column_index).start;
+        app.set_column_scroll(column_index, start);
+    }
+}
+
+pub fn scroll_at(area: Rect, app: &mut App, x: u16, y: u16, lines: isize, theme: &Theme) {
+    if lines == 0 {
+        return;
+    }
+    if let Mode::TaskDetails { cursor } = app.mode {
+        let (modal, _) = task_detail_layout(area, app, cursor, theme);
+        if contains(modal, x, y) {
+            scroll_task_details(area, app, lines, theme);
+        }
+        return;
+    }
+    if !matches!(app.mode, Mode::Board | Mode::Moving(_)) {
+        return;
+    }
+
+    let [board_area, _] = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(area);
+    if let Some((column_index, _)) = visible_lanes(board_area, app)
+        .into_iter()
+        .find(|(_, lane)| contains(*lane, x, y))
+    {
+        app.scroll_column(column_index, lines.signum());
+    }
 }
 
 fn draw_board(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
@@ -289,7 +335,24 @@ fn draw_cards(frame: &mut Frame, area: Rect, app: &App, column_index: usize, the
     let selected = (column_index == app.selected_column)
         .then_some(app.selected_task)
         .flatten();
-    for (task_index, rect) in visible_cards(area, app, column_index) {
+    let layout = column_card_layout(area, app, column_index);
+    if layout.hidden_above > 0 {
+        frame.render_widget(
+            Paragraph::new(format!("↑ ({} more)", layout.hidden_above))
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(theme.muted).bg(theme.background)),
+            Rect::new(area.x, area.y, area.width, 1),
+        );
+    }
+    if layout.hidden_below > 0 {
+        frame.render_widget(
+            Paragraph::new(format!("↓ ({} more)", layout.hidden_below))
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(theme.muted).bg(theme.background)),
+            Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1),
+        );
+    }
+    for (task_index, rect) in layout.cards {
         let task = &tasks[task_index];
         let selected = selected == Some(task_index);
         let moving = selected && matches!(app.mode, Mode::Moving(_));
@@ -335,11 +398,8 @@ fn draw_cards(frame: &mut Frame, area: Rect, app: &App, column_index: usize, the
 
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let help = match app.mode {
-        Mode::Board if theme.mouse_enabled => {
-            "BOARD mode · arrows/hjkl/click navigate · enter details · a add task · C add column · r rename · D delete · m MOVE · ? help · q quit"
-        }
         Mode::Board => {
-            "BOARD mode · arrows/hjkl navigate · enter details · a add task · C add column · r rename · D delete · m MOVE · ? help · q quit"
+            "BOARD mode · a add task · C add column · r rename · D delete · m MOVE · ? help · q quit"
         }
         Mode::Moving(_) => {
             "MOVE mode · arrows/hjkl reposition · enter/m confirm · esc cancel · q quit"
@@ -404,16 +464,17 @@ fn draw_task_details(frame: &mut Frame, app: &App, cursor: usize, theme: &Theme)
     let (area, document) = task_detail_layout(frame.area(), app, cursor, theme);
     let content_height = usize::from(modal_content_area(area).height).max(1);
     let lines = task_detail_window_lines(app, &document, cursor, content_height, theme);
-    render_modal(
+    let more_below = task_detail_more_below(app, &document, cursor, content_height);
+    render_task_detail_modal(
         frame,
         area,
-        " Task details ",
         lines,
         if theme.mouse_enabled {
             "hjkl · ^u/^d/wheel scroll · Enter/e edit · a/d items · Esc/q close"
         } else {
             "hjkl · ^u/^d scroll · Enter/e edit · a/d items · Esc/q close"
         },
+        more_below,
         theme,
     );
     if theme.mouse_enabled {
@@ -589,7 +650,7 @@ fn task_detail_layout(
         .max(3)
         .min(viewport.height.max(1));
     let min_height = 12.min(max_height);
-    let desired_height = usize_to_u16(document.lines.len().saturating_add(3));
+    let desired_height = usize_to_u16(document.lines.len().saturating_add(4));
     let height = desired_height.clamp(min_height, max_height);
     (centered(viewport, 92, height), document)
 }
@@ -616,12 +677,12 @@ fn task_detail_scroll(
 }
 
 fn task_detail_has_scroll_hints(document_height: usize, content_height: usize) -> bool {
-    document_height > content_height && content_height >= 3
+    document_height > content_height && content_height >= 2
 }
 
 fn task_detail_visible_rows(document_height: usize, content_height: usize) -> usize {
     if task_detail_has_scroll_hints(document_height, content_height) {
-        content_height - 2
+        content_height - 1
     } else {
         content_height
     }
@@ -653,12 +714,18 @@ fn task_detail_window_lines(
         Line::raw("")
     });
     lines.extend(document.lines[scroll..end].iter().cloned());
-    lines.push(if end < document.lines.len() {
-        indicator("↓ (more)")
-    } else {
-        Line::raw("")
-    });
     lines
+}
+
+fn task_detail_more_below(
+    app: &App,
+    document: &TaskDetailDocument,
+    cursor: usize,
+    content_height: usize,
+) -> bool {
+    let scroll = task_detail_scroll(app, document, cursor, content_height);
+    let visible_rows = task_detail_visible_rows(document.lines.len(), content_height);
+    scroll.saturating_add(visible_rows) < document.lines.len()
 }
 
 fn task_history_line_groups(
@@ -682,33 +749,109 @@ fn task_history_line_groups(
         .map(|event| Span::raw(relative_time(event.at, now)).width())
         .max()
         .unwrap_or(0);
-    let prefix_width = 2 + timestamp_width + 2;
-    let event_width = width.saturating_sub(prefix_width).max(1);
+    let timestamp_prefix_width = 2 + timestamp_width + 2;
+    let available = width.saturating_sub(timestamp_prefix_width);
+    let column_gap = 2.min(available.saturating_sub(1));
+    let usable = available.saturating_sub(column_gap);
+    let minimum_content_width = usable.saturating_sub(1).clamp(1, 16);
+    let desired_type_width = events
+        .iter()
+        .map(|event| Span::raw(history_event_type(event)).width())
+        .max()
+        .unwrap_or(1);
+    let type_width = desired_type_width
+        .min(usable.saturating_sub(minimum_content_width).max(1))
+        .max(1);
+    let content_width = usable.saturating_sub(type_width).max(1);
 
     events
         .iter()
         .rev()
         .map(|event| {
-            let content = history_event_content_lines(app, event, event_width, theme);
+            let event_type = history_text_lines(
+                &history_event_type(event),
+                type_width,
+                history_event_type_style(event, theme),
+            );
+            let content = history_event_content_lines(app, event, content_width, theme);
             let timestamp = relative_time(event.at, now);
-            content
-                .into_iter()
-                .enumerate()
-                .map(|(index, line)| {
+            let row_count = event_type.len().max(content.len());
+            let mut event_type = event_type.into_iter();
+            let mut content = content.into_iter();
+            (0..row_count)
+                .map(|index| {
                     let mut spans = vec![Span::styled(
                         if index == 0 {
                             format!("  {timestamp:<timestamp_width$}  ")
                         } else {
-                            " ".repeat(prefix_width)
+                            " ".repeat(timestamp_prefix_width)
                         },
                         Style::default().fg(theme.muted),
                     )];
-                    spans.extend(line.spans);
+                    if let Some(line) = event_type.next() {
+                        let line_width = line.width();
+                        spans.extend(line.spans);
+                        spans.push(Span::raw(" ".repeat(type_width.saturating_sub(line_width))));
+                    } else {
+                        spans.push(Span::raw(" ".repeat(type_width)));
+                    }
+                    spans.push(Span::raw(" ".repeat(column_gap)));
+                    if let Some(line) = content.next() {
+                        spans.extend(line.spans);
+                    }
                     Line::from(spans)
                 })
                 .collect()
         })
         .collect()
+}
+
+fn history_event_type(event: &TaskHistoryEvent) -> String {
+    match &event.kind {
+        TaskHistoryKind::Created => "created".into(),
+        TaskHistoryKind::Moved {
+            from_column,
+            to_column,
+            ..
+        } if from_column == to_column => "reordered".into(),
+        TaskHistoryKind::Moved { .. } => "moved".into(),
+        TaskHistoryKind::Changed { field, to, .. }
+            if checklist_status_item(field).is_some() && to == "complete" =>
+        {
+            "checked".into()
+        }
+        TaskHistoryKind::Changed { field, to, .. }
+            if checklist_status_item(field).is_some() && to == "incomplete" =>
+        {
+            "unchecked".into()
+        }
+        TaskHistoryKind::Changed { field, .. } => format!("changed {field}"),
+        TaskHistoryKind::Added { field, .. } if is_checklist_item_field(field) => "added".into(),
+        TaskHistoryKind::Removed { field, .. } if is_checklist_item_field(field) => {
+            "removed".into()
+        }
+        TaskHistoryKind::Added { field, .. } => format!("added {field}"),
+        TaskHistoryKind::Removed { field, .. } => format!("removed {field}"),
+        TaskHistoryKind::TagAdded(_) => "added tag".into(),
+        TaskHistoryKind::TagRemoved(_) => "removed tag".into(),
+    }
+}
+
+fn history_event_type_style(event: &TaskHistoryEvent, theme: &Theme) -> Style {
+    let color = match &event.kind {
+        TaskHistoryKind::Created => theme.text,
+        TaskHistoryKind::Added { .. } | TaskHistoryKind::TagAdded(_) => theme.success,
+        TaskHistoryKind::Removed { .. } | TaskHistoryKind::TagRemoved(_) => theme.danger,
+        TaskHistoryKind::Changed { .. } => theme.change,
+        TaskHistoryKind::Moved { .. } => theme.muted,
+    };
+    Style::default().fg(color)
+}
+
+fn is_checklist_item_field(field: &str) -> bool {
+    field
+        .strip_prefix("checklist item ")
+        .is_some_and(|index| index.parse::<usize>().is_ok())
 }
 
 fn history_event_content_lines(
@@ -719,28 +862,26 @@ fn history_event_content_lines(
 ) -> Vec<Line<'static>> {
     let muted = Style::default().fg(theme.muted);
     match &event.kind {
-        TaskHistoryKind::Created => history_text_lines("Created task", width, muted),
+        TaskHistoryKind::Created => history_text_lines("task", width, muted),
         TaskHistoryKind::Moved {
             from_column,
             to_column,
             ..
         } if from_column == to_column => {
-            history_text_lines(&format!("Reordered within {from_column}"), width, muted)
+            history_text_lines(&format!("within {from_column}"), width, muted)
         }
         TaskHistoryKind::Moved {
             from_column,
             to_column,
             ..
-        } => history_text_lines(
-            &format!("Moved from {from_column} to {to_column}"),
-            width,
-            muted,
-        ),
+        } => history_text_lines(&format!("{from_column} → {to_column}"), width, muted),
         TaskHistoryKind::Changed { field, from, to } => {
-            if let Some(description) = describe_checklist_status_change(field, to) {
-                return history_text_lines(&description, width, muted);
+            if let Some(item) = checklist_status_item(field)
+                && matches!(to.as_str(), "complete" | "incomplete")
+            {
+                return history_text_lines(&item, width, muted);
             }
-            let mut lines = history_text_lines(&format!("Changed {field} from:"), width, muted);
+            let mut lines = history_text_lines("from:", width, muted);
             lines.extend(history_value_lines(
                 from,
                 width,
@@ -754,14 +895,12 @@ fn history_event_content_lines(
             ));
             lines
         }
-        TaskHistoryKind::Added { field, value } => {
-            history_text_lines(&format!("Added {field}: {value}"), width, muted)
+        TaskHistoryKind::Added { value, .. } | TaskHistoryKind::Removed { value, .. } => {
+            history_text_lines(value, width, muted)
         }
-        TaskHistoryKind::Removed { field, value } => {
-            history_text_lines(&format!("Removed {field}: {value}"), width, muted)
+        TaskHistoryKind::TagAdded(tag) | TaskHistoryKind::TagRemoved(tag) => {
+            history_tag_event_lines(app, tag, width, theme)
         }
-        TaskHistoryKind::TagAdded(tag) => history_tag_event_line(app, "Added tag:", tag, theme),
-        TaskHistoryKind::TagRemoved(tag) => history_tag_event_line(app, "Removed tag:", tag, theme),
     }
 }
 
@@ -790,16 +929,29 @@ fn history_value_lines(value: &str, width: usize, style: Style) -> Vec<Line<'sta
     .collect()
 }
 
-fn history_tag_event_line(app: &App, label: &str, tag: &str, theme: &Theme) -> Vec<Line<'static>> {
+fn history_tag_event_lines(
+    app: &App,
+    tag: &str,
+    width: usize,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
     let style = app
         .board
         .tag_by_name(tag)
         .map(tag_style)
         .unwrap_or_else(|| Style::default().fg(theme.text).bg(theme.border));
-    vec![Line::from(vec![
-        Span::styled(format!("{label} "), Style::default().fg(theme.muted)),
-        Span::styled(format!(" {tag} "), style),
-    ])]
+    let token = format!(" {tag} ");
+    let mut remaining = token.as_str();
+    let mut lines = Vec::new();
+    while !remaining.is_empty() {
+        let split = width_prefix_end(remaining, width.max(1));
+        lines.push(Line::from(Span::styled(
+            remaining[..split].to_owned(),
+            style,
+        )));
+        remaining = &remaining[split..];
+    }
+    lines
 }
 
 fn checklist_section_header(theme: &Theme) -> Vec<Line<'static>> {
@@ -1891,6 +2043,50 @@ fn draw_text_input_help(frame: &mut Frame, theme: &Theme) {
     );
 }
 
+fn render_task_detail_modal(
+    frame: &mut Frame,
+    area: Rect,
+    lines: Vec<Line<'static>>,
+    hint: &str,
+    more_below: bool,
+    theme: &Theme,
+) {
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Task details ")
+        .title_alignment(Alignment::Center)
+        .title_style(
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        )
+        .border_style(Style::default().fg(theme.accent))
+        .style(Style::default().bg(theme.background));
+    let [content_area, more_area, hint_area] = task_detail_modal_areas(area);
+    frame.render_widget(block, area);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default().fg(theme.text).bg(theme.background))
+            .wrap(Wrap { trim: false }),
+        content_area,
+    );
+    if more_below {
+        frame.render_widget(
+            Paragraph::new("↓ (more)")
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(theme.muted).bg(theme.background)),
+            more_area,
+        );
+    }
+    frame.render_widget(
+        Paragraph::new(hint)
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(theme.muted).bg(theme.background)),
+        hint_area,
+    );
+}
+
 fn render_modal(
     frame: &mut Frame,
     area: Rect,
@@ -2128,12 +2324,89 @@ fn lane_regions(lane: Rect) -> (Rect, Rect) {
 }
 
 fn visible_cards(area: Rect, app: &App, column_index: usize) -> Vec<(usize, Rect)> {
+    column_card_layout(area, app, column_index).cards
+}
+
+fn column_card_layout(area: Rect, app: &App, column_index: usize) -> ColumnCardLayout {
     let tasks = &app.board.columns[column_index].tasks;
-    let selected = (column_index == app.selected_column)
-        .then_some(app.selected_task)
-        .flatten();
+    if tasks.is_empty() || area.width == 0 || area.height == 0 {
+        return ColumnCardLayout {
+            start: 0,
+            cards: Vec::new(),
+            hidden_above: 0,
+            hidden_below: tasks.len(),
+        };
+    }
+    let selected = (column_index == app.selected_column
+        && app.column_scroll_follows_cursor(column_index))
+    .then_some(app.selected_task)
+    .flatten();
     let moving = matches!(app.mode, Mode::Moving(_));
-    let start = first_visible_task(tasks, selected, moving, area.width, area.height);
+    let mut start = app
+        .column_scroll(column_index)
+        .min(tasks.len().saturating_sub(1));
+    if let Some(selected) = selected.filter(|selected| *selected < tasks.len()) {
+        if selected < start {
+            start = selected;
+        }
+        while start < selected {
+            let layout = column_cards_from_start(area, tasks, start, selected, moving);
+            let required = task_card_height(&tasks[selected], area.width, moving);
+            if layout
+                .cards
+                .iter()
+                .find(|(index, _)| *index == selected)
+                .is_some_and(|(_, rect)| rect.height >= required)
+            {
+                break;
+            }
+            start += 1;
+        }
+    }
+    column_cards_from_start(area, tasks, start, selected.unwrap_or(usize::MAX), moving)
+}
+
+fn column_cards_from_start(
+    area: Rect,
+    tasks: &[Task],
+    start: usize,
+    selected: usize,
+    moving: bool,
+) -> ColumnCardLayout {
+    let hidden_above = start.min(tasks.len());
+    let top_rows = u16::from(hidden_above > 0 && area.height > 0);
+    let without_bottom = Rect::new(
+        area.x,
+        area.y.saturating_add(top_rows),
+        area.width,
+        area.height.saturating_sub(top_rows),
+    );
+    let (mut cards, mut hidden_below) =
+        layout_card_rects(without_bottom, tasks, start, selected, moving);
+    if hidden_below > 0 && without_bottom.height > 0 {
+        let with_bottom = Rect::new(
+            without_bottom.x,
+            without_bottom.y,
+            without_bottom.width,
+            without_bottom.height.saturating_sub(1),
+        );
+        (cards, hidden_below) = layout_card_rects(with_bottom, tasks, start, selected, moving);
+    }
+    ColumnCardLayout {
+        start,
+        cards,
+        hidden_above,
+        hidden_below,
+    }
+}
+
+fn layout_card_rects(
+    area: Rect,
+    tasks: &[Task],
+    start: usize,
+    selected: usize,
+    moving: bool,
+) -> (Vec<(usize, Rect)>, usize) {
     let mut cards = Vec::new();
     let mut y = area.y;
     for (task_index, task) in tasks.iter().enumerate().skip(start) {
@@ -2141,61 +2414,22 @@ fn visible_cards(area: Rect, app: &App, column_index: usize) -> Vec<(usize, Rect
         if remaining == 0 {
             break;
         }
-        let required = task_card_height(task, area.width, moving && selected == Some(task_index));
-        if required > remaining && !cards.is_empty() {
-            break;
-        }
+        let required = task_card_height(task, area.width, moving && selected == task_index);
         let height = required.min(remaining);
         cards.push((task_index, Rect::new(area.x, y, area.width, height)));
+        if height < required {
+            break;
+        }
         y = y
             .saturating_add(height)
             .saturating_add(TASK_CARD_GAP)
             .min(area.bottom());
     }
-    cards
-}
-
-fn first_visible_task(
-    tasks: &[Task],
-    selected: Option<usize>,
-    moving: bool,
-    width: u16,
-    available_height: u16,
-) -> usize {
-    let Some(selected) = selected.filter(|index| *index < tasks.len()) else {
-        return 0;
-    };
-    let height_through_selected: u32 = tasks
-        .iter()
-        .enumerate()
-        .take(selected + 1)
-        .map(|(index, task)| {
-            u32::from(task_card_footprint(
-                task,
-                width,
-                moving && index == selected,
-            ))
-        })
-        .sum();
-    if height_through_selected <= u32::from(available_height) {
-        return 0;
-    }
-
-    let mut start = selected;
-    let mut used = u32::from(task_card_footprint(&tasks[selected], width, moving));
-    while start > 0 {
-        let previous = u32::from(task_card_footprint(&tasks[start - 1], width, false));
-        if used + previous > u32::from(available_height) {
-            break;
-        }
-        used += previous;
-        start -= 1;
-    }
-    start
-}
-
-fn task_card_footprint(task: &Task, width: u16, moving: bool) -> u16 {
-    task_card_height(task, width, moving).saturating_add(TASK_CARD_GAP)
+    let hidden_below = cards
+        .last()
+        .map(|(index, _)| tasks.len().saturating_sub(index.saturating_add(1)))
+        .unwrap_or_else(|| tasks.len().saturating_sub(start));
+    (cards, hidden_below)
 }
 
 fn task_card_height(task: &Task, width: u16, moving: bool) -> u16 {
@@ -2237,9 +2471,17 @@ fn contains(area: Rect, x: u16, y: u16) -> bool {
 }
 
 fn modal_content_area(area: Rect) -> Rect {
+    task_detail_modal_areas(area)[0]
+}
+
+fn task_detail_modal_areas(area: Rect) -> [Rect; 3] {
     let inner = Block::default().borders(Borders::ALL).inner(area);
-    let [content, _] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
-    content
+    Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner)
 }
 
 fn task_details_close_area(area: Rect) -> Rect {
@@ -2332,6 +2574,177 @@ mod tests {
             parse_color("#12abEF").unwrap(),
             Color::Rgb(0x12, 0xab, 0xef)
         );
+    }
+
+    #[test]
+    fn board_footer_omits_navigation_and_enter_hints() {
+        let app = App::new(Board::default());
+        let theme = Theme::from_config(&ThemeConfig::default()).unwrap();
+        let backend = TestBackend::new(100, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| draw(frame, &app, &theme)).unwrap();
+
+        let footer = buffer_row_text(terminal.backend().buffer(), 100, 9);
+        assert!(footer.contains("BOARD mode · a add task"));
+        assert!(!footer.contains("navigate"));
+        assert!(!footer.contains("enter"));
+    }
+
+    #[test]
+    fn board_background_is_black_in_every_cell() {
+        let app = App::new(Board::default());
+        let theme = Theme::from_config(&ThemeConfig::default()).unwrap();
+        let backend = TestBackend::new(60, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| draw(frame, &app, &theme)).unwrap();
+
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .all(|cell| cell.bg == TUI_BACKGROUND)
+        );
+    }
+
+    #[test]
+    fn partial_cards_render_and_selection_scrolls_them_fully_into_view() {
+        let mut board = Board::default();
+        board.add_task(0, "short".into());
+        board.add_task(0, "x".repeat(45));
+        let mut app = App::new(board);
+        let area = Rect::new(0, 0, 20, 4);
+        let tall_height = task_card_height(&app.board.columns[0].tasks[1], area.width, false);
+        assert_eq!(tall_height, 3);
+
+        let layout = column_card_layout(area, &app, 0);
+        assert_eq!(layout.cards.len(), 2);
+        assert_eq!(layout.cards[1].0, 1);
+        assert!(layout.cards[1].1.height < tall_height);
+
+        app.select_target(0, Some(1));
+        let layout = column_card_layout(area, &app, 0);
+        assert_eq!(layout.start, 1);
+        assert_eq!(layout.hidden_above, 1);
+        assert_eq!(layout.cards, vec![(1, Rect::new(0, 1, 20, tall_height))]);
+    }
+
+    #[test]
+    fn columns_keep_independent_scroll_positions_and_count_hidden_cards() {
+        let mut board = Board::default();
+        board.add_column("DONE".into()).unwrap();
+        for index in 0..8 {
+            board.add_task(0, format!("Task {index}"));
+        }
+        let mut app = App::new(board);
+        app.selected_task = Some(7);
+        let viewport = Rect::new(0, 0, 60, 12);
+
+        prepare_board_scrolls(viewport, &mut app);
+        let saved_start = app.column_scroll(0);
+        assert!(saved_start > 0);
+        app.select_target(1, None);
+        prepare_board_scrolls(viewport, &mut app);
+        assert_eq!(app.column_scroll(0), saved_start);
+
+        let lane = visible_lanes(Rect::new(0, 0, 60, 11), &app)[0].1;
+        let inner = Block::default()
+            .borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM)
+            .inner(lane_regions(lane).1);
+        let saved_layout = column_card_layout(inner, &app, 0);
+        assert_eq!(saved_layout.start, saved_start);
+        assert_eq!(saved_layout.hidden_above, saved_start);
+
+        app.scroll_column(0, -100);
+        let top_layout = column_card_layout(inner, &app, 0);
+        assert_eq!(top_layout.hidden_above, 0);
+        assert!(top_layout.hidden_below > 0);
+        let theme = Theme::from_config(&ThemeConfig::default()).unwrap();
+        let backend = TestBackend::new(60, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &app, &theme)).unwrap();
+        let screen = buffer_text(terminal.backend().buffer(), 60, 12);
+        assert!(screen.contains(&format!("↓ ({} more)", top_layout.hidden_below)));
+        assert!(!screen.contains("↑ ("));
+
+        app.scroll_column(0, 100);
+        let bottom_layout = column_card_layout(inner, &app, 0);
+        assert_eq!(bottom_layout.hidden_above, 7);
+        assert_eq!(bottom_layout.hidden_below, 0);
+
+        terminal.draw(|frame| draw(frame, &app, &theme)).unwrap();
+        let screen = buffer_text(terminal.backend().buffer(), 60, 12);
+        assert!(screen.contains("↑ (7 more)"));
+        assert!(!screen.contains("↓ ("));
+    }
+
+    #[test]
+    fn returning_to_a_column_restores_its_cursor_without_scrolling_again() {
+        let mut board = Board::default();
+        board.add_column("DONE".into()).unwrap();
+        for column in 0..2 {
+            for index in 0..8 {
+                board.add_task(column, format!("Task {column}-{index}"));
+            }
+        }
+        let mut app = App::new(board);
+        let viewport = Rect::new(0, 0, 60, 12);
+        app.selected_task = Some(7);
+        prepare_board_scrolls(viewport, &mut app);
+        let first_column_scroll = app.column_scroll(0);
+        assert!(first_column_scroll > 0);
+
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        for _ in 0..3 {
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        prepare_board_scrolls(viewport, &mut app);
+        assert_eq!(app.selected_task, Some(2));
+
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(app.selected_task, Some(7));
+        prepare_board_scrolls(viewport, &mut app);
+        assert_eq!(app.column_scroll(0), first_column_scroll);
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_the_hovered_column_and_only_the_details_window() {
+        let mut board = Board::default();
+        board.add_column("DONE".into()).unwrap();
+        for column in 0..2 {
+            for index in 0..8 {
+                board.add_task(column, format!("Task {column}-{index}"));
+            }
+        }
+        for index in 0..20 {
+            board.columns[0].tasks[0]
+                .checklist
+                .push(ChecklistItem::new(format!("Item {index}")));
+        }
+        let mut app = App::new(board);
+        let theme = Theme::from_config(&ThemeConfig::default()).unwrap();
+        let viewport = Rect::new(0, 0, 80, 24);
+
+        scroll_at(viewport, &mut app, 5, 5, 3, &theme);
+        assert_eq!(app.column_scroll(0), 1);
+        assert_eq!(app.column_scroll(1), 0);
+        scroll_at(viewport, &mut app, 60, 5, 3, &theme);
+        assert_eq!(app.column_scroll(0), 1);
+        assert_eq!(app.column_scroll(1), 1);
+        scroll_at(viewport, &mut app, 5, 23, 3, &theme);
+        assert_eq!(app.column_scroll(0), 1);
+
+        app.select_target(0, Some(0));
+        app.open_selected_task_details();
+        let (modal, _) = task_detail_layout(viewport, &app, 0, &theme);
+        scroll_at(viewport, &mut app, 0, 0, 3, &theme);
+        assert_eq!(app.task_detail_scroll, 0);
+        scroll_at(viewport, &mut app, modal.x + 1, modal.y + 1, 3, &theme);
+        assert_eq!(app.task_detail_scroll, 3);
+        assert_eq!(app.column_scroll(0), 1);
     }
 
     #[test]
@@ -2481,24 +2894,23 @@ mod tests {
         assert!(document.lines.len() > usize::from(modal_content_area(modal).height));
         let content_height = usize::from(modal_content_area(modal).height);
         let visible_rows = task_detail_visible_rows(document.lines.len(), content_height);
-        assert_eq!(visible_rows, content_height - 2);
+        assert_eq!(visible_rows, content_height - 1);
         let max_scroll = document.lines.len() - visible_rows;
 
         let backend = TestBackend::new(100, 40);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw(frame, &app, &theme)).unwrap();
-        let content = modal_content_area(modal);
+        let [content, more_area, _hint_area] = task_detail_modal_areas(modal);
         assert!(!buffer_row_text(terminal.backend().buffer(), 100, content.y).contains("↑ (more)"));
         assert!(
-            buffer_row_text(terminal.backend().buffer(), 100, content.bottom() - 1)
-                .contains("↓ (more)")
+            buffer_row_text(terminal.backend().buffer(), 100, more_area.y).contains("↓ (more)")
         );
         assert_eq!(
             hit_test(viewport, &app, content.x + 4, content.y, &theme),
             None
         );
         assert_eq!(
-            hit_test(viewport, &app, content.x + 4, content.bottom() - 1, &theme),
+            hit_test(viewport, &app, more_area.x + 4, more_area.y, &theme),
             None
         );
         let first_checklist_line = document.checklist_ranges[0].1.start;
@@ -2512,8 +2924,7 @@ mod tests {
         terminal.draw(|frame| draw(frame, &app, &theme)).unwrap();
         assert!(buffer_row_text(terminal.backend().buffer(), 100, content.y).contains("↑ (more)"));
         assert!(
-            buffer_row_text(terminal.backend().buffer(), 100, content.bottom() - 1)
-                .contains("↓ (more)")
+            buffer_row_text(terminal.backend().buffer(), 100, more_area.y).contains("↓ (more)")
         );
 
         scroll_task_details(viewport, &mut app, 1_000, &theme);
@@ -2521,8 +2932,7 @@ mod tests {
         terminal.draw(|frame| draw(frame, &app, &theme)).unwrap();
         assert!(buffer_row_text(terminal.backend().buffer(), 100, content.y).contains("↑ (more)"));
         assert!(
-            !buffer_row_text(terminal.backend().buffer(), 100, content.bottom() - 1)
-                .contains("↓ (more)")
+            !buffer_row_text(terminal.backend().buffer(), 100, more_area.y).contains("↓ (more)")
         );
 
         scroll_task_details(viewport, &mut app, -3, &theme);
@@ -2542,6 +2952,15 @@ mod tests {
         let screen = buffer_text(terminal.backend().buffer(), 100, 40);
         assert!(!screen.contains("↑ (more)"));
         assert!(!screen.contains("↓ (more)"));
+        let (short_modal, _) = task_detail_layout(viewport, &short_app, 0, &theme);
+        let [_short_content, short_more, short_hint] = task_detail_modal_areas(short_modal);
+        for x in short_more.x..short_more.right() {
+            assert_eq!(terminal.backend().buffer()[(x, short_more.y)].symbol(), " ");
+        }
+        assert!(
+            buffer_row_text(terminal.backend().buffer(), 100, short_hint.y)
+                .contains("Enter/e edit")
+        );
     }
 
     #[test]
@@ -2582,25 +3001,25 @@ mod tests {
         assert_eq!(buffer[(0, 2)].symbol(), "├");
         assert_eq!(buffer[(39, 2)].symbol(), "┤");
         assert_eq!(buffer[(20, 2)].symbol(), "─");
-        assert_eq!(buffer[(20, 2)].fg, Color::Indexed(208));
+        assert_eq!(buffer[(20, 2)].fg, TUI_ACCENT);
         assert_eq!(buffer[(0, 3)].symbol(), "│");
         assert_eq!(buffer[(39, 3)].symbol(), "│");
-        assert_eq!(buffer[(0, 3)].fg, Color::Indexed(208));
-        assert_eq!(buffer[(39, 3)].fg, Color::Indexed(208));
-        assert_eq!(buffer[(0, 0)].bg, Color::Black);
-        assert_eq!(buffer[(0, 2)].bg, Color::Black);
+        assert_eq!(buffer[(0, 3)].fg, TUI_ACCENT);
+        assert_eq!(buffer[(39, 3)].fg, TUI_ACCENT);
+        assert_eq!(buffer[(0, 0)].bg, TUI_BACKGROUND);
+        assert_eq!(buffer[(0, 2)].bg, TUI_BACKGROUND);
         assert_eq!(buffer[(1, 1)].symbol(), "▊");
-        assert_eq!(buffer[(1, 1)].fg, Color::Indexed(208));
-        assert_eq!(buffer[(1, 1)].bg, Color::Black);
-        assert_eq!(buffer[(2, 1)].bg, Color::Black);
-        assert_eq!(buffer[(3, 1)].bg, Color::Black);
-        assert_eq!(buffer[(36, 1)].bg, Color::Black);
-        assert_eq!(buffer[(37, 1)].bg, Color::Black);
-        assert_eq!(buffer[(38, 1)].bg, Color::Black);
+        assert_eq!(buffer[(1, 1)].fg, TUI_ACCENT);
+        assert_eq!(buffer[(1, 1)].bg, TUI_BACKGROUND);
+        assert_eq!(buffer[(2, 1)].bg, TUI_BACKGROUND);
+        assert_eq!(buffer[(3, 1)].bg, TUI_BACKGROUND);
+        assert_eq!(buffer[(36, 1)].bg, TUI_BACKGROUND);
+        assert_eq!(buffer[(37, 1)].bg, TUI_BACKGROUND);
+        assert_eq!(buffer[(38, 1)].bg, TUI_BACKGROUND);
         assert_eq!(buffer[(19, 1)].symbol(), "T");
-        assert_eq!(buffer[(19, 1)].fg, Color::Indexed(208));
+        assert_eq!(buffer[(19, 1)].fg, TUI_ACCENT);
         for x in 1..39 {
-            assert_eq!(buffer[(x, 1)].bg, Color::Black);
+            assert_eq!(buffer[(x, 1)].bg, TUI_BACKGROUND);
         }
     }
 
@@ -2620,8 +3039,8 @@ mod tests {
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer[(1, 3)].symbol(), "▊");
         assert_eq!(buffer[(1, 4)].symbol(), "▊");
-        assert_eq!(buffer[(1, 3)].fg, Color::Indexed(208));
-        assert_eq!(buffer[(1, 4)].fg, Color::Indexed(208));
+        assert_eq!(buffer[(1, 3)].fg, TUI_ACCENT);
+        assert_eq!(buffer[(1, 4)].fg, TUI_ACCENT);
         assert_eq!(buffer[(3, 3)].symbol(), "S");
         assert_eq!(buffer[(3, 3)].fg, Color::White);
         assert_eq!(buffer[(5, 4)].symbol(), "-");
@@ -2633,9 +3052,9 @@ mod tests {
         assert_eq!(buffer[(20, 2)].fg, Color::Gray);
         assert_eq!(buffer[(0, 0)].fg, Color::Gray);
         assert_eq!(buffer[(39, 3)].fg, Color::Gray);
-        assert_eq!(buffer[(1, 3)].bg, Color::Black);
-        assert_eq!(buffer[(3, 3)].bg, Color::Black);
-        assert_eq!(buffer[(7, 4)].bg, Color::Black);
+        assert_eq!(buffer[(1, 3)].bg, TUI_BACKGROUND);
+        assert_eq!(buffer[(3, 3)].bg, TUI_BACKGROUND);
+        assert_eq!(buffer[(7, 4)].bg, TUI_BACKGROUND);
     }
 
     #[test]
@@ -2657,8 +3076,8 @@ mod tests {
         assert_eq!(buffer[(38, 3)].symbol(), "┐");
         assert_eq!(buffer[(1, 6)].symbol(), "└");
         assert_eq!(buffer[(38, 6)].symbol(), "┘");
-        assert_eq!(buffer[(1, 3)].fg, Color::Indexed(208));
-        assert_eq!(buffer[(38, 6)].fg, Color::Indexed(208));
+        assert_eq!(buffer[(1, 3)].fg, TUI_ACCENT);
+        assert_eq!(buffer[(38, 6)].fg, TUI_ACCENT);
         assert_eq!(buffer[(2, 4)].symbol(), "M");
         assert_eq!(buffer[(2, 4)].fg, Color::White);
         assert_ne!(buffer[(2, 4)].symbol(), "▊");
@@ -2739,13 +3158,13 @@ mod tests {
         let buffer = terminal.backend().buffer();
         for y in description_y..=description_y + 1 {
             for x in inner_x..area.right() - 1 {
-                assert_eq!(buffer[(x, y)].bg, Color::Black);
+                assert_eq!(buffer[(x, y)].bg, TUI_BACKGROUND);
             }
         }
-        assert_eq!(buffer[(inner_x, description_y)].fg, Color::Indexed(208));
+        assert_eq!(buffer[(inner_x, description_y)].fg, TUI_ACCENT);
         assert_eq!(
             buffer[(inner_x + value_column as u16, description_y + 1)].fg,
-            Color::Indexed(208)
+            TUI_ACCENT
         );
     }
 
@@ -2815,10 +3234,11 @@ mod tests {
 
         let screen = buffer_text(terminal.backend().buffer(), 100, 40);
         assert!(screen.contains("History"));
-        assert!(screen.contains("Changed title from:"));
+        assert!(screen.contains("changed title"));
+        assert!(screen.contains("from:"));
         assert!(screen.contains("Old title"));
         assert!(screen.contains("New title"));
-        assert!(screen.contains("Added tag:"));
+        assert!(screen.contains("added tag"));
         assert!(screen.contains("minutes ago"));
         assert!(screen.contains("arrows/hjkl select"));
 
@@ -2837,8 +3257,8 @@ mod tests {
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer[(old_x as u16, old_y as u16)].fg, Color::Red);
         assert_eq!(buffer[(new_x as u16, new_y as u16)].fg, Color::Green);
-        assert_eq!(buffer[(0, 39)].fg, Color::Black);
-        assert_eq!(buffer[(0, 39)].bg, Color::Black);
+        assert_eq!(buffer[(0, 39)].fg, TUI_BACKGROUND);
+        assert_eq!(buffer[(0, 39)].bg, TUI_BACKGROUND);
     }
 
     #[test]
@@ -2853,7 +3273,7 @@ mod tests {
     }
 
     #[test]
-    fn single_value_history_is_inline_and_moves_show_only_column_names() {
+    fn history_splits_event_types_and_content_into_aligned_columns() {
         let mut board = Board::default();
         board.add_task(0, "Task".into());
         let app = App::new(board);
@@ -2865,9 +3285,14 @@ mod tests {
                 value: "2026-08-05".into(),
             },
         };
+        assert_eq!(history_event_type(&event), "added due date");
+        assert_eq!(
+            history_event_type_style(&event, &theme).fg,
+            Some(theme.success)
+        );
         let lines = history_event_content_lines(&app, &event, 60, &theme);
         assert_eq!(lines.len(), 1);
-        assert_eq!(line_text(&lines[0]), "Added due date: 2026-08-05");
+        assert_eq!(line_text(&lines[0]), "2026-08-05");
 
         let moved = TaskHistoryEvent {
             at: Utc::now(),
@@ -2878,8 +3303,77 @@ mod tests {
                 to_position: 1,
             },
         };
+        assert_eq!(history_event_type(&moved), "moved");
         let lines = history_event_content_lines(&app, &moved, 60, &theme);
-        assert_eq!(line_text(&lines[0]), "Moved from TODO to DOING");
+        assert_eq!(line_text(&lines[0]), "TODO → DOING");
+
+        let added_tag = TaskHistoryEvent {
+            at: Utc::now(),
+            kind: TaskHistoryKind::TagAdded("urgent".into()),
+        };
+        let removed_tag = TaskHistoryEvent {
+            at: Utc::now(),
+            kind: TaskHistoryKind::TagRemoved("urgent".into()),
+        };
+        assert_eq!(history_event_type(&added_tag), "added tag");
+        assert_eq!(history_event_type(&removed_tag), "removed tag");
+
+        let checked = TaskHistoryEvent {
+            at: Utc::now(),
+            kind: TaskHistoryKind::Changed {
+                field: "checklist status for \"Run tests\"".into(),
+                from: "incomplete".into(),
+                to: "complete".into(),
+            },
+        };
+        assert_eq!(history_event_type(&checked), "checked");
+        assert_eq!(
+            history_event_type_style(&checked, &theme).fg,
+            Some(theme.change)
+        );
+        let lines = history_event_content_lines(&app, &checked, 60, &theme);
+        assert_eq!(line_text(&lines[0]), "Run tests");
+
+        let added_item = TaskHistoryEvent {
+            at: Utc::now(),
+            kind: TaskHistoryKind::Added {
+                field: "checklist item 2".into(),
+                value: "Ship it".into(),
+            },
+        };
+        let removed_item = TaskHistoryEvent {
+            at: Utc::now(),
+            kind: TaskHistoryKind::Removed {
+                field: "checklist item 2".into(),
+                value: "Ship it".into(),
+            },
+        };
+        assert_eq!(history_event_type(&added_item), "added");
+        assert_eq!(history_event_type(&removed_item), "removed");
+        assert_eq!(
+            history_event_type_style(&removed_item, &theme).fg,
+            Some(theme.danger)
+        );
+        let lines = history_event_content_lines(&app, &added_item, 60, &theme);
+        assert_eq!(line_text(&lines[0]), "Ship it");
+
+        let created = TaskHistoryEvent {
+            at: Utc::now(),
+            kind: TaskHistoryKind::Created,
+        };
+        assert_eq!(
+            history_event_type_style(&created, &theme).fg,
+            Some(theme.text)
+        );
+
+        let mut app = app;
+        app.task_history
+            .insert(1, vec![event.clone(), moved.clone()]);
+        let groups = task_history_line_groups(&app, &app.board.columns[0].tasks[0], 80, &theme);
+        let moved_row = line_text(&groups[0][0]);
+        let due_row = line_text(&groups[1][0]);
+        assert_eq!(moved_row.find("moved"), due_row.find("added due date"));
+        assert_eq!(moved_row.find("TODO"), due_row.find("2026-08-05"));
     }
 
     #[test]
