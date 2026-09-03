@@ -10,6 +10,15 @@ Every confirmed mutation updates a granular JSON state tree and creates a commit
 in a dedicated Git repository. Interactive and CLI changes use the same model,
 validation, event ledger, and history-indexing path.
 
+## Demo
+
+![A guided tour of the tdo TUI: board navigation, colored tags and due dates, checklists, task details, the Git-backed history timeline, and MOVE mode](demo/tdo-demo.gif)
+
+Every card in the tour describes the feature it is demonstrating. The board is
+generated from scratch each time by [`demo/record.sh`](demo/record.sh), which
+never touches your real data — see [Recording the demo](#recording-the-demo).
+([Download the MP4.](demo/tdo-demo.mp4))
+
 ## Highlights
 
 - Vertical kanban swimlanes with up to nine columns, full card titles, colored
@@ -35,14 +44,25 @@ validation, event ledger, and history-indexing path.
 
 ## Install and run
 
+Install the latest version straight from the repository in one command:
+
+```sh
+cargo install --git https://github.com/cosmicbuffalo/tdo
+```
+
+Or clone the repository and use the Makefile, which wraps the Cargo workflow:
+
 ```sh
 git clone git@github.com:cosmicbuffalo/tdo.git
 cd tdo
-cargo install --path .
+make install
 tdo
 ```
 
-For development, `cargo run` opens the TUI without installing the binary.
+`make install` runs `cargo install --path . --force`, so it also reinstalls
+over an existing binary. `make run` opens the TUI without installing, and
+`make check` runs the same fmt/clippy/test suite as CI. See the header of the
+[`Makefile`](Makefile) for every available target.
 
 On first run, `tdo` creates:
 
@@ -83,9 +103,6 @@ events, and hides mouse-only controls and hints.
 | --- | --- |
 | `?` | Open the floating keymap outside text fields; `Esc` or `q` returns to the prior view |
 | `Ctrl-/` | Open the floating keymap anywhere; while editing text it shows only textarea controls |
-| Left click | Select a column header, task card, or a column's empty space |
-| Double-click a task | Select it and open Task Details |
-| Mouse wheel | Scroll the column under the pointer without moving the cursor |
 | Arrow keys or `hjkl` | Move between column headers and task cards |
 | `1`–`9` | Jump to a column |
 | `Enter` | Open details for the selected column or task |
@@ -95,6 +112,9 @@ events, and hides mouse-only controls and hints.
 | `D` | Delete the selected task or column after confirmation |
 | `m` | Begin moving the selected task |
 | `q` / `Ctrl-C` | Quit |
+| Left click | Select a column header, task card, or a column's empty space |
+| Double-click a task | Select it and open Task Details |
+| Mouse wheel | Scroll the column under the pointer without moving the cursor |
 
 `D` opens a confirmation dialog with cursor-selectable Cancel and Delete
 buttons. Cancel is selected by default; use left/right, `h`/`l`, or `Tab` and
@@ -422,4 +442,38 @@ a database.
 cargo fmt --all -- --check
 cargo test
 cargo clippy --all-targets --all-features -- -D warnings
+```
+
+## Recording the demo
+
+The animated tour at the top of this README is produced by
+[VHS](https://github.com/charmbracelet/vhs) from a throwaway board:
+
+```sh
+demo/record.sh
+```
+
+This does two things:
+
+1. seeds a fresh, self-describing demo board (`demo/seed.sh`, built entirely
+   through the tdo CLI) into an isolated, ephemeral data directory
+   (`/tmp/tdo-demo-rec`) with its own config file; and
+2. renders `demo/tdo-demo.gif` and `demo/tdo-demo.mp4` from
+   [`demo/demo.tape`](demo/demo.tape).
+
+**Your live board is never touched.** The demo tooling overrides both
+`TDO_DATA_DIR` and `TDO_CONFIG` to throwaway paths and wipes the recording
+sandbox before and after each run, so your real data
+(`~/.local/share/tdo` or your configured `persistence.repo`) and config
+(`~/.config/tdo/config.toml`) are completely isolated from it. You can
+re-record a fresh demo at any time, even after you have started using tdo with
+your own data. As a safety net, `demo/seed.sh` requires an explicit
+`TDO_DATA_DIR` and refuses to run against the default live board.
+
+Recording requires [`vhs`](https://github.com/charmbracelet/vhs), `ttyd`, and
+`ffmpeg` on your `PATH`. The board itself can also be built into any isolated
+directory without recording:
+
+```sh
+TDO_DATA_DIR=/tmp/tdo-demo demo/seed.sh
 ```

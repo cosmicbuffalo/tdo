@@ -11,8 +11,8 @@ use ratatui::{
 
 use crate::{
     app::{
-        App, DeleteChoice, DeleteConfirmation, DeleteTarget, Mode, NewTagField, TagPickerRow,
-        TextEditor,
+        App, DeleteChoice, DeleteConfirmation, DeleteTarget, InputKind, Mode, NewTagField,
+        TagPickerRow, TextEditor,
     },
     config::ThemeConfig,
     history::{TaskHistoryEvent, TaskHistoryKind, checklist_status_item},
@@ -23,6 +23,8 @@ const MIN_COLUMN_WIDTH: u16 = 26;
 const TASK_CURSOR_WIDTH: u16 = 2;
 const TASK_CARD_GAP: u16 = 1;
 const TASK_CARD_RIGHT_PADDING: u16 = 1;
+// Total (bordered) width of the narrow "Add checklist item" overlay dialog.
+const CHECKLIST_INPUT_WIDTH: u16 = 30;
 const TUI_BACKGROUND: Color = Color::Rgb(0, 0, 0);
 const TUI_ACCENT: Color = Color::Rgb(255, 135, 0);
 
@@ -101,7 +103,17 @@ pub fn draw(frame: &mut Frame, app: &App, theme: &Theme) {
     match &app.mode {
         Mode::TaskDetails { cursor } => draw_task_details(frame, app, *cursor, theme),
         Mode::ColumnDetails { cursor } => draw_column_details(frame, app, *cursor, theme),
-        Mode::Input(input) => draw_input(frame, input, app, theme),
+        Mode::Input(input) => {
+            // The "Add checklist item" dialog floats on top of the Task Details
+            // window rather than replacing it, so keep the details painted
+            // behind it.
+            if matches!(input.kind, InputKind::AddChecklistItem)
+                && let Some(cursor) = input.return_details_cursor()
+            {
+                draw_task_details(frame, app, cursor, theme);
+            }
+            draw_input(frame, input, app, theme)
+        }
         Mode::DatePicker(picker) => draw_date_picker(frame, picker, theme),
         Mode::TagPicker(picker) => draw_tag_picker(frame, app, picker, theme),
         Mode::NewTag(state) => draw_new_tag(frame, app, state, theme),
@@ -1512,13 +1524,17 @@ fn rendered_input_cursor_row(
 
 fn draw_input(frame: &mut Frame, input: &crate::app::InputState, app: &App, theme: &Theme) {
     let frame_area = frame.area();
-    let width = frame_area
-        .width
-        .saturating_mul(64)
-        .saturating_div(100)
-        .max(24)
-        .min(frame_area.width)
-        .max(1);
+    let width = if matches!(input.kind, InputKind::AddChecklistItem) {
+        CHECKLIST_INPUT_WIDTH.min(frame_area.width).max(1)
+    } else {
+        frame_area
+            .width
+            .saturating_mul(64)
+            .saturating_div(100)
+            .max(24)
+            .min(frame_area.width)
+            .max(1)
+    };
     let inner_width = width.saturating_sub(2).max(1);
     let text_width = inner_width.saturating_sub(3).max(1);
     let mut lines = text_editor_lines(&input.editor, "", theme);
@@ -1576,8 +1592,14 @@ fn draw_input(frame: &mut Frame, input: &crate::app::InputState, app: &App, them
         prefix_area,
     );
     frame.render_widget(paragraph.scroll((scroll, 0)), content_area);
+    // The narrow checklist overlay cannot fit the full hint, so use a compact one.
+    let hint = if matches!(input.kind, InputKind::AddChecklistItem) {
+        "Ctrl-G editor · Ctrl-/ keys"
+    } else {
+        "Ctrl-G $EDITOR · Ctrl-/ keymap"
+    };
     frame.render_widget(
-        Paragraph::new("Ctrl-G $EDITOR · Ctrl-/ keymap")
+        Paragraph::new(hint)
             .alignment(Alignment::Center)
             .style(Style::default().fg(theme.muted).bg(theme.background)),
         hint_area,
@@ -1932,11 +1954,6 @@ fn draw_help(frame: &mut Frame, theme: &Theme) {
         Line::raw(""),
         heading("BOARD"),
         key("arrows / hjkl", "navigate headers and task cards"),
-        if theme.mouse_enabled {
-            key("Click / double", "select / open a task card")
-        } else {
-            Line::raw("")
-        },
         key("1-9", "jump to a column"),
         key("Enter", "open column or task details"),
         key("a", "add a task"),
@@ -1944,6 +1961,11 @@ fn draw_help(frame: &mut Frame, theme: &Theme) {
         key("r", "rename the selected column"),
         key("D", "delete the selected column or task"),
         key("m", "enter MOVE mode"),
+        if theme.mouse_enabled {
+            key("Click / double", "select / open a task card")
+        } else {
+            Line::raw("")
+        },
         heading("DATE PICKER"),
         key("arrows / hjkl", "select a day"),
         key("PgUp / PgDn", "change month"),

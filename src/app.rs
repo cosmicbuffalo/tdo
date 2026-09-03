@@ -1241,6 +1241,18 @@ impl App {
     }
 }
 
+impl InputState {
+    /// The Task Details cursor this input returns to, when it was opened from
+    /// Task Details. Lets the renderer keep the details window painted behind
+    /// overlay dialogs such as adding a checklist item.
+    pub fn return_details_cursor(&self) -> Option<usize> {
+        match self.return_to {
+            ReturnTo::TaskDetails(cursor) => Some(cursor),
+            _ => None,
+        }
+    }
+}
+
 impl InputKind {
     pub fn title(&self) -> &'static str {
         match self {
