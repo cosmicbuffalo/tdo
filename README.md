@@ -1,5 +1,7 @@
 # tdo
 
+[![CI](https://github.com/cosmicbuffalo/tdo/actions/workflows/ci.yml/badge.svg)](https://github.com/cosmicbuffalo/tdo/actions/workflows/ci.yml)
+
 `tdo` is a modal, keyboard-first kanban board for the terminal. Its BOARD,
 MOVE, DETAILS, INPUT, CONFIRM, and HELP modes each expose a focused set of
 actions. Running `tdo` opens the TUI; the same board is also fully accessible
